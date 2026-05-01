@@ -1,0 +1,15 @@
+# LiteLLM 設定ファイル
+# vLLM をバックエンドとして登録、API キー認証を有効化
+
+model_list:
+  - litellm_params:
+      model: vllm
+      api_base: http://vllm:8001
+      api_key: ""
+      rpm: 10000
+      pass_through_optional_params: true
+    model_name: "vllm-local"
+
+# 環境変数で制御する項目
+# LITELLM_MASTER_KEY: sk-vllm-manager-xxxx  (API キー)
+# LITELLM_DROP_PARAMS: true

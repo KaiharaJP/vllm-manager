@@ -1,0 +1,90 @@
+services:
+  # === バックエンド (FastAPI) ===
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: vllm-manager-backend
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    volumes:
+      - vllm-data:/app/data
+      - hf-cache:/root/.cache/huggingface
+    environment:
+      - VLLM_PORT=${VLLM_PORT:-8001}
+      - HF_HOME=/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - vllm-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/docs"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # === vLLM サーバー (バックエンドが管理) ===
+  # このサービスは直接起動せず、FastAPI から subprocess で制御される
+  # GPU コンテナとして定義するだけ
+
+  # === LiteLLM プロキシ ===
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    container_name: vllm-manager-litellm
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./config/litellm_config.yaml:/app/config.yaml
+    command: >
+      --config /app/config.yaml
+      --port 4000
+      --host 0.0.0.0
+      --detailed_debug
+    environment:
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-vllm-default-key}
+      - VLLM_API_BASE=http://vllm:8001
+    networks:
+      - vllm-net
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:4000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # === フロントエンド (Next.js) ===
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - NEXT_PUBLIC_API_URL=http://localhost:8000
+        - NEXT_PUBLIC_LITELLM_URL=http://localhost:4000
+    container_name: vllm-manager-frontend
+    ports:
+      - "${FRONTEND_PORT:-3000}:3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://backend:8000
+      - NEXT_PUBLIC_LITELLM_URL=http://litellm:4000
+    depends_on:
+      - backend
+      - litellm
+    networks:
+      - vllm-net
+    restart: unless-stopped
+
+volumes:
+  vllm-data:
+    driver: local
+  hf-cache:
+    driver: local
+
+networks:
+  vllm-net:
+    driver: bridge

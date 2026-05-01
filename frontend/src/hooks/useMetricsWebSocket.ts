@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
-import type { MetricsData, MetricsMessage } from "@/types";
+import type { AppEvent, DownloadJob, MetricsData, MetricsMessage } from "@/types";
 
 const WS_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -9,6 +9,8 @@ export function useMetricsWebSocket() {
   const wsRef = useRef<WebSocket | null>(null);
   const [metrics, setMetrics] = useState<MetricsData | null>(null);
   const [history, setHistory] = useState<MetricsData[]>([]);
+  const [events, setEvents] = useState<AppEvent[]>([]);
+  const [downloads, setDownloads] = useState<DownloadJob[]>([]);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -26,16 +28,30 @@ export function useMetricsWebSocket() {
 
     ws.onmessage = (event) => {
       try {
-        const msg: MetricsMessage = JSON.parse(event.data);
+        const msg = JSON.parse(event.data) as MetricsMessage | AppEvent;
 
-        if (msg.type === "history" && Array.isArray(msg.data)) {
+        if (msg.type === "event_history" && Array.isArray((msg as AppEvent).data)) {
+          setEvents((msg as AppEvent).data as AppEvent[]);
+        } else if (msg.type === "history" && Array.isArray(msg.data)) {
           setHistory(msg.data as MetricsData[]);
           setMetrics((msg.data as MetricsData[]).at(-1) ?? null);
         } else if (msg.type === "metrics") {
-          setMetrics(msg.data as MetricsData);
-          setHistory((prev) => [...prev.slice(-99), msg.data as MetricsData]);
+          const data = (msg as AppEvent).data as MetricsData;
+          setMetrics(data);
+          setHistory((prev) => [...prev.slice(-99), data]);
+          setEvents((prev) => [...prev.slice(-199), msg as AppEvent]);
+        } else if ((msg as AppEvent).type === "model_download") {
+          const job = (msg as AppEvent).data as DownloadJob;
+          setDownloads((prev) => {
+            const next = prev.filter((item) => item.id !== job.id);
+            return [job, ...next].slice(0, 50);
+          });
+          setEvents((prev) => [...prev.slice(-199), msg as AppEvent]);
         } else if (msg.type === "error") {
           setError(msg.message ?? "Unknown error");
+          setEvents((prev) => [...prev.slice(-199), msg as AppEvent]);
+        } else if (msg.type !== "pong") {
+          setEvents((prev) => [...prev.slice(-199), msg as AppEvent]);
         }
       } catch {
         // 無効なメッセージは無視
@@ -61,5 +77,5 @@ export function useMetricsWebSocket() {
     };
   }, [connect]);
 
-  return { metrics, history, connected, error };
+  return { metrics, history, events, downloads, connected, error };
 }

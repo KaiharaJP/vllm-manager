@@ -3,8 +3,22 @@
 
 FROM python:3.11-slim
 
+# プロキシ環境では build 時にも明示的に引き継ぐ
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG NO_PROXY
+ENV HTTP_PROXY=${HTTP_PROXY} \
+    HTTPS_PROXY=${HTTPS_PROXY} \
+    NO_PROXY=${NO_PROXY} \
+    http_proxy=${HTTP_PROXY} \
+    https_proxy=${HTTPS_PROXY} \
+    no_proxy=${NO_PROXY}
+
 # システム依存関係
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# 一部環境で HTTP ミラーへ接続できないため HTTPS に切り替える
+RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
     curl \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
@@ -28,10 +42,11 @@ RUN mkdir -p /app/data
 
 # HuggingFace キャッシュディレクトリ
 ENV HF_HOME=/root/.cache/huggingface
+ENV VLLM_MANAGER_DATA_DIR=/app/data
 RUN mkdir -p ${HF_HOME}
 
 # ポート
-EXPOSE 8000
+EXPOSE 8000 8001
 
 # 健康チェック
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \

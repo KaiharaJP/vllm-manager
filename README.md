@@ -1,108 +1,160 @@
 # vLLM Manager
 
-vLLM サーバーを Web UI から管理するアプリケーション。モデル選択、コンテキスト長設定、リアルタイムモニタリング、LiteLLM 認証対応。
+vLLM サーバーを Web UI から管理するためのローカル管理アプリです。モデル登録、管理者限定の Hugging Face ダウンロード、vLLM 起動/停止、リアルタイムメトリクス、LiteLLM のユーザー/チーム/API キー/予算管理をまとめて扱います。
 
 ## アーキテクチャ
 
-```
+通常起動では、vLLM は `backend` コンテナ内のサブプロセスとして起動します。LiteLLM とメトリクス取得先もこの backend 管理の vLLM に向きます。
+
+```text
 ┌─────────────┐     ┌─────────────┐     ┌─────────────┐
 │  Next.js    │────▶│  FastAPI    │────▶│  vLLM       │
-│  (Frontend) │     │  (Backend)  │     │  (Inference)│
+│  frontend   │     │  backend    │     │  subprocess │
 │  :3000      │     │  :8000      │     │  :8001      │
 └─────────────┘     └──────┬──────┘     └─────────────┘
                            │
-                    ┌──────▼──────┐
-                    │  LiteLLM    │
-                    │  (Proxy)    │
-                    │  :4000      │
-                    └─────────────┘
+              ┌────────────┴────────────┐
+              ▼                         ▼
+        ┌───────────┐             ┌────────────┐
+        │ LiteLLM   │────────────▶│ PostgreSQL │
+        │ :4000     │             │ LiteLLM DB │
+        └───────────┘             └────────────┘
 ```
 
-## 機能
+`docker-compose.yml` には `standalone-vllm` profile の `vllm` サービスも残していますが、通常は起動しません。手動検証などで vLLM コンテナを直接立てたい場合だけ使います。
 
-- **サーバー管理**: モデル選択、起動/停止/再起動
-- **コンテキスト長設定**: 4K/8K/32K/64K/128K のプリセット選択
-- **スロット数設定**: 最大同時リクエスト数のスライダー調整
-- **リアルタイムモニタリング**: GPU メモリ使用量、リクエスト数、スループット、トークン処理速度
-- **LiteLLM 認証**: API キー認証の ON/OFF トグル
-- **ログ表示**: vLLM サーバーログのリアルタイム表示
+## 主な機能
+
+- **ログイン/RBAC**: `admin` と `user` ロール。サーバー操作、モデルダウンロード、LiteLLM 管理は admin のみ。
+- **サーバー管理**: 登録済みモデルを選び、vLLM を起動/停止/再起動。
+- **起動パラメータ**: コンテキスト長、最大同時リクエスト数、GPU メモリ利用率、テンソル並列数、起動時ダウンロード有無を UI から指定。
+- **モデル管理**: admin が Hugging Face `repo_id` を登録し、非同期ジョブでダウンロード。
+- **リアルタイムイベント**: `/ws/metrics` と `/ws/events` でメトリクス、モデルダウンロード、サーバージョブ、LiteLLM 変更イベントを配信。
+- **LiteLLM 管理**: vLLM Manager 画面から LiteLLM のユーザー、チーム、virtual key、予算、RPM/TPM、利用ログを扱う。
+- **永続化**: vLLM Manager の設定/ユーザー/ジョブは `vllm-data` volume、HF キャッシュは `hf-cache` volume、LiteLLM 管理データは Postgres の `litellm-db` volume に保存。
 
 ## 前提条件
 
 - Docker & Docker Compose
-- NVIDIA GPU + NVIDIA Container Toolkit
+- NVIDIA GPU
+- NVIDIA Container Toolkit
+- Hugging Face gated model を使う場合は Hugging Face access token
 
 ## クイックスタート
 
 ```bash
-# 1. リポジトリをクローン
-git clone <repository>
-cd vllm-manager
-
-# 2. 環境変数設定
 cp .env.example .env
-# .env を編集 (必要に応じて)
-
-# 3. 起動
+# .env を編集する
 docker compose up -d --build
-
-# 4. Web UI にアクセス
-# http://localhost:3000
 ```
 
-## 環境変数
+アクセス先のデフォルトは次の通りです。
 
-| 変数 | 説明 | デフォルト |
-|------|------|-----------|
-| `VLLM_PORT` | vLLM サーバーポート | 8001 |
-| `BACKEND_PORT` | FastAPI ポート | 8000 |
-| `FRONTEND_PORT` | Next.js ポート | 3000 |
-| `LITELLM_MASTER_KEY` | LiteLLM API キー | sk-vllm-default-key |
-| `HF_TOKEN` | HuggingFace トークン | (なし) |
+- vLLM Manager UI: `http://localhost:13000`
+- FastAPI backend: `http://localhost:18000`
+- backend 管理 vLLM OpenAI API: `http://localhost:18001`
+- LiteLLM Proxy: `http://localhost:14000`
 
-## API エンドポイント
+初期ログインは `.env` の `VLLM_MANAGER_ADMIN_USER` / `VLLM_MANAGER_ADMIN_PASSWORD` です。デフォルトは `admin` / `admin` なので、実運用では必ず変更してください。
 
-### サーバー管理
-- `GET /api/status` - サーバー状態
-- `POST /api/start` - サーバー起動
-- `POST /api/stop` - サーバー停止
-- `POST /api/restart` - サーバー再起動
+## .env に入れる情報
 
-### 設定
-- `GET /api/config` - 現在設定
-- `GET /api/models` - 利用可能モデル
-- `GET /api/context-presets` - コンテキスト長プリセット
-- `GET /api/log` - サーバーログ
+`.env.example` を `.env` にコピーして使います。`.env` には API キーやパスワードが入るため、Git にコミットしないでください。
 
-### WebSocket
-- `WS /ws/metrics` - リアルタイムメトリクス
+### vLLM Manager 認証
 
-## 利用可能なモデル
+| 変数 | 必須 | 説明 | 例/デフォルト |
+|------|------|------|---------------|
+| `VLLM_MANAGER_ADMIN_USER` | 推奨 | 初回起動時に作られる vLLM Manager 管理者ユーザー名。`/app/data/users.json` が既にある場合は既存ユーザーが優先されます。 | `admin` |
+| `VLLM_MANAGER_ADMIN_PASSWORD` | 推奨 | 初回管理者のパスワード。bcrypt hash 化されて `vllm-data` volume に保存されます。 | `admin` |
 
-- Llama 3.3 70B Instruct
-- Llama 3.1 8B Instruct
-- Qwen 2.5 72B Instruct
-- Qwen 2.5 7B Instruct
-- Mistral 7B Instruct v0.3
-- Phi-3 Mini 4K Instruct
-- Gemma 2 27B IT
-- Gemma 2 9B IT
+`VLLM_MANAGER_ADMIN_PASSWORD=admin` のまま公開ネットワークに出さないでください。既に初期ユーザーが作られた後に変更したい場合は、UI で別 admin を作るか、`vllm-data` volume 内の `users.json` を再作成します。
 
-## 使用例
+### アプリケーション公開ポート
 
-### curl で API を叩く
+| 変数 | 必須 | 説明 | 例/デフォルト |
+|------|------|------|---------------|
+| `FRONTEND_PORT` | 任意 | ホスト側の Next.js UI ポート。 | `13000` |
+| `BACKEND_PORT` | 任意 | ホスト側の FastAPI ポート。 | `18000` |
+| `VLLM_HOST_PORT` | 任意 | ホスト側に公開する vLLM OpenAI API ポート。 | `18001` |
+| `VLLM_PORT` | 任意 | コンテナ内の vLLM ポート。通常は変えません。 | `8001` |
+| `LITELLM_PORT` | 任意 | ホスト側の LiteLLM Proxy ポート。 | `14000` |
+
+`docker-compose.yml` 側のデフォルトは `FRONTEND_PORT=13000`, `BACKEND_PORT=18000`, `VLLM_HOST_PORT=18001`, `LITELLM_PORT=14000` です。古い README の `3000/8000/4000` ではなく、ホストからはこのポートを見ます。
+
+### Hugging Face
+
+| 変数 | 必須 | 説明 | 例/デフォルト |
+|------|------|------|---------------|
+| `HF_TOKEN` | gated model では必須 | Hugging Face の access token。backend と standalone vLLM の両方に `HF_TOKEN` / `HUGGINGFACE_HUB_TOKEN` として渡されます。 | `hf_xxx` |
+| `DOWNLOAD_WORKERS` | 任意 | モデルダウンロード時の並列数。大きすぎるとネットワークやディスクに負荷がかかります。 | `8` |
+
+`HF_TOKEN` は UI に平文で返しません。gated model を使う場合は Hugging Face 側でライセンス同意を済ませた token を設定してください。
+
+### LiteLLM
+
+| 変数 | 必須 | 説明 | 例/デフォルト |
+|------|------|------|---------------|
+| `LITELLM_MASTER_KEY` | 必須 | vLLM Manager backend が LiteLLM Admin API を呼ぶための master key。推論 API の Bearer token としても使えます。 | `sk-vllm-default-key` |
+| `LITELLM_UI_USERNAME` | 任意 | LiteLLM 標準 Admin UI のログインユーザー。vLLM Manager 統合 UI とは別です。 | `admin` |
+| `LITELLM_UI_PASSWORD` | 任意 | LiteLLM 標準 Admin UI のログインパスワード。 | `admin` |
+| `LITELLM_DB_USER` | 任意 | LiteLLM 用 Postgres ユーザー。 | `litellm` |
+| `LITELLM_DB_PASSWORD` | 任意 | LiteLLM 用 Postgres パスワード。 | `litellm` |
+| `LITELLM_DB_NAME` | 任意 | LiteLLM 用 Postgres DB 名。 | `litellm` |
+
+LiteLLM の virtual keys、users、teams、budgets、spend logs は `litellm-db` volume の Postgres に保存されます。`LITELLM_MASTER_KEY` は `sk-` で始まる値にしてください。
+
+### vLLM 起動デフォルト
+
+| 変数 | 必須 | 説明 | 例/デフォルト |
+|------|------|------|---------------|
+| `VLLM_MAX_MODEL_LEN` | 任意 | vLLM 起動フォームの初期値として使いたい最大コンテキスト長。現状の保存設定がある場合は保存値が優先されます。 | `8192` |
+| `VLLM_MAX_NUM_SEQS` | 任意 | 最大同時リクエスト数の初期値。 | `256` |
+| `VLLM_GPU_MEMORY_UTILIZATION` | 任意 | GPU メモリ利用率の初期値。 | `0.9` |
+| `VLLM_TENSOR_PARALLEL_SIZE` | 任意 | テンソル並列数の初期値。 | `1` |
+
+現在の vLLM 起動設定は `vllm-data` volume の `config.json` に保存されます。UI で変更した値が次回以降も使われます。
+
+### Docker / Proxy
+
+| 変数 | 必須 | 説明 | 例/デフォルト |
+|------|------|------|---------------|
+| `DOCKER_COMPOSE_PROJECT_NAME` | 任意 | Docker Compose のプロジェクト名。 | `vllm-manager` |
+| `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` | 環境により必要 | Docker build、backend、standalone vLLM に渡されます。社内 proxy 環境で使います。 | 空 |
+
+## データの保存先
+
+- `vllm-data`: vLLM Manager の `users.json`, `config.json`, `download_jobs.json`, `models.json`, `vllm.pid`, `vllm.log`
+- `hf-cache`: Hugging Face model cache
+- `litellm-db`: LiteLLM の Postgres データ
+- ブラウザ `localStorage`: ログインセッション token のみ
+
+backend を再起動するとブラウザの token は残りますが、現在の簡易セッションは backend メモリ上にあるため、再ログインが必要になることがあります。
+
+## 使い方
+
+### 1. ログイン
+
+UI にアクセスし、`.env` の `VLLM_MANAGER_ADMIN_USER` / `VLLM_MANAGER_ADMIN_PASSWORD` でログインします。admin だけがサーバー操作、モデル管理、LiteLLM 管理を実行できます。
+
+### 2. モデル登録とダウンロード
+
+`モデル管理` タブで Hugging Face `repo_id` を登録します。登録後、`ダウンロード` を押すと backend で非同期ジョブが開始され、WebSocket 経由で進捗が画面に反映されます。
+
+### 3. vLLM 起動
+
+`サーバー管理` タブでモデル、コンテキスト長、最大同時リクエスト数、GPU メモリ利用率、テンソル並列数を指定して起動します。未ダウンロードモデルを起動する場合は「起動前にモデルキャッシュを確認/ダウンロードする」を有効にできます。
+
+### 4. LiteLLM 管理
+
+`ユーザー/APIキー` タブで vLLM Manager ユーザーを作成し、LiteLLM の virtual key を発行します。key 発行時に `models`, `max_budget`, `budget_duration`, `rpm_limit`, `tpm_limit` を指定できます。
+
+### 5. 推論
+
+LiteLLM 経由で呼び出す例です。
 
 ```bash
-# サーバー状態確認
-curl http://localhost:8000/api/status
-
-# サーバー起動
-curl -X POST http://localhost:8000/api/start \
-  -H "Content-Type: application/json" \
-  -d '{"model_id": "meta-llama/Llama-3.1-8B-Instruct", "context_length": 8192}'
-
-# LiteLLM 経由で推論
-curl http://localhost:4000/v1/chat/completions \
+curl http://localhost:14000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-vllm-default-key" \
   -d '{
@@ -112,42 +164,115 @@ curl http://localhost:4000/v1/chat/completions \
   }'
 ```
 
+backend 管理 vLLM を直接叩く場合は `http://localhost:18001/v1/chat/completions` を使います。
+
+## API エンドポイント
+
+### 認証
+
+- `POST /api/auth/login` - vLLM Manager にログイン
+- `GET /api/auth/me` - 現在のログインユーザー
+- `GET /api/users` - Manager ユーザー一覧 admin only
+- `POST /api/users` - Manager ユーザー作成/更新 admin only
+
+### サーバー管理
+
+- `GET /api/status` - vLLM サーバー状態
+- `POST /api/start` - vLLM 起動 admin only
+- `POST /api/stop` - vLLM 停止 admin only
+- `POST /api/restart` - vLLM 再起動 admin only
+- `GET /api/log` - vLLM ログ admin only
+
+### モデル管理
+
+- `GET /api/models` - 登録済みモデル一覧
+- `POST /api/models` - モデル登録 admin only
+- `GET /api/model-downloads` - ダウンロードジョブ一覧 admin only
+- `POST /api/model-downloads` - ダウンロードジョブ開始 admin only
+- `GET /api/context-presets` - コンテキスト長プリセット
+
+### LiteLLM
+
+- `GET /api/litellm/status` - LiteLLM health
+- `GET /api/litellm/keys` - virtual key 一覧 admin only
+- `POST /api/litellm/keys` - virtual key 発行 admin only
+- `POST /api/litellm/keys/delete` - virtual key 削除 admin only
+- `GET /api/litellm/users` - LiteLLM user 一覧 admin only
+- `POST /api/litellm/users` - LiteLLM user 作成 admin only
+- `GET /api/litellm/teams` - LiteLLM team 一覧 admin only
+- `POST /api/litellm/teams` - LiteLLM team 作成 admin only
+- `GET /api/litellm/spend` - spend logs admin only
+
+### WebSocket
+
+- `WS /ws/metrics` - 互換パス。メトリクスとイベントを受信
+- `WS /ws/events` - イベント購読用パス
+
+イベントは `type`, `timestamp`, `data`, `message`, `actor` を持つ envelope 形式です。主な `type` は `metrics`, `model_download`, `server_job`, `model_registered`, `user_updated`, `litellm_key_updated`, `error` です。
+
+## standalone vLLM profile
+
+通常は使いません。vLLM コンテナを直接起動したい場合だけ、次のように profile を指定します。
+
+```bash
+docker compose --profile standalone-vllm up -d vllm
+```
+
+この profile を使う場合、backend 管理の vLLM とポートが競合しないようにしてください。
+
+## トラブルシュート
+
+- **ログインできない**: 初回ユーザーは `vllm-data` volume の `users.json` に作られます。`.env` を変えても既存 `users.json` がある場合は上書きされません。
+- **gated model が落ちる**: `HF_TOKEN` が設定されているか、Hugging Face 側で対象モデルの利用許諾が済んでいるか確認してください。
+- **LiteLLM のキー管理が動かない**: `litellm-db` が起動しているか、`LITELLM_MASTER_KEY` が backend と LiteLLM で一致しているか確認してください。
+- **メトリクスが出ない**: vLLM が起動して `/metrics` を返すまで待ってください。起動直後やモデルロード中は空になることがあります。
+- **ポートが違う**: ホストから見るポートは `.env` の `FRONTEND_PORT`, `BACKEND_PORT`, `VLLM_HOST_PORT`, `LITELLM_PORT` です。
+
 ## プロジェクト構造
 
-```
+```text
 vllm-manager/
-├── app/                          # FastAPI バックエンド
-│   ├── main.py                   # API エンドポイント
-│   ├── server_manager.py         # vLLM サーバー管理
-│   └── metrics_scraper.py        # Prometheus metrics スクラッパー
-├── frontend/                     # Next.js フロントエンド
-│   ├── src/
-│   │   ├── app/                  # ページ
-│   │   ├── components/           # コンポーネント
-│   │   ├── hooks/                # カスタムフック
-│   │   ├── lib/                  # API クライアント
-│   │   └── types/                # TypeScript 型定義
-│   └── Dockerfile
-├── config/                       # 設定ファイル
+├── app/
+│   ├── auth.py              # Manager ログイン/RBAC
+│   ├── event_bus.py         # WebSocket event bus
+│   ├── litellm_client.py    # LiteLLM Admin API wrapper
+│   ├── main.py              # FastAPI routes
+│   ├── metrics_scraper.py   # vLLM metrics scraper
+│   ├── model_manager.py     # model catalog / download jobs
+│   └── server_manager.py    # backend-managed vLLM process
+├── frontend/
+│   └── src/
+│       ├── app/
+│       ├── components/
+│       ├── hooks/
+│       ├── lib/
+│       └── types/
+├── config/
 │   └── litellm_config.yaml
 ├── docker-compose.yml
 ├── Dockerfile.backend
+├── IMPLEMENTATION_PHASES.md
 └── requirements.txt
 ```
 
 ## 開発
 
 ```bash
-# バックエンド開発
-cd vllm-manager
+# バックエンド
 pip install -r requirements.txt
-uvicorn app.main:app --reload --port 8000
+VLLM_MANAGER_DATA_DIR=/tmp/vllm-manager-data uvicorn app.main:app --reload --port 8000
 
-# フロントエンド開発
+# フロントエンド
 cd frontend
 npm install
 npm run dev
 ```
+
+ローカル開発では Docker Compose とポートが違う場合があります。`NEXT_PUBLIC_API_URL` と `NEXT_PUBLIC_LITELLM_URL` を環境に合わせてください。
+
+## 注意
+
+このアプリは GPU サーバーの管理操作、モデルダウンロード、API キー発行を行います。外部公開する場合は、強い管理者パスワード、ネットワーク制限、TLS、バックアップ、監査ログ運用を必ず検討してください。
 
 ## ライセンス
 

@@ -13,6 +13,16 @@ export interface Model {
   id: string;
   name: string;
   size: string;
+  revision?: string | null;
+  gated?: boolean;
+  trust_remote_code?: boolean;
+  recommended_context_length?: number;
+  required_gpu_memory_gb?: number | null;
+  allowed_roles?: string[];
+  source?: string;
+  downloaded?: boolean;
+  cache_path?: string | null;
+  cache_size_bytes?: number;
 }
 
 export interface ContextPreset {
@@ -58,8 +68,53 @@ export interface MetricsData {
   gpu_compute_time: number;
 }
 
+export interface AppUser {
+  username: string;
+  role: "admin" | "user";
+  litellm_user_id?: string | null;
+  litellm_team_id?: string | null;
+  disabled?: boolean;
+  created_at?: number;
+}
+
+export interface DownloadJob {
+  id: string;
+  model_id: string;
+  status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  progress: number;
+  downloaded_bytes: number;
+  total_bytes: number;
+  current_file?: string | null;
+  message?: string | null;
+  error?: string | null;
+  created_at: number;
+  updated_at: number;
+  actor?: string | null;
+}
+
+export interface AppEvent {
+  id?: string;
+  type:
+    | "metrics"
+    | "history"
+    | "event_history"
+    | "model_download"
+    | "model_registered"
+    | "server_job"
+    | "user_updated"
+    | "litellm_key_updated"
+    | "litellm_user_updated"
+    | "litellm_team_updated"
+    | "error"
+    | "pong";
+  timestamp?: number;
+  data?: MetricsData | MetricsData[] | DownloadJob | DownloadJob[] | AppEvent[] | unknown;
+  message?: string;
+  actor?: string | null;
+}
+
 export interface MetricsMessage {
-  type: "metrics" | "history" | "error" | "pong";
+  type: "metrics" | "history" | "event_history" | "error" | "pong";
   data?: MetricsData | MetricsData[];
   message?: string;
 }

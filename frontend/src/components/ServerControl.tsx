@@ -33,6 +33,7 @@ export default function ServerControl({
     max_num_seqs: config?.max_num_seqs ?? 256,
     gpu_memory_utilization: config?.gpu_memory_utilization ?? 0.9,
     tensor_parallel_size: config?.tensor_parallel_size ?? 1,
+    download_model: true,
   });
 
   const [action, setAction] = useState<"idle" | "starting" | "stopping" | "restarting">("idle");
@@ -149,7 +150,7 @@ export default function ServerControl({
         </div>
 
         {/* GPU メモリ利用率 */}
-        <div className="mb-6">
+        <div className="mb-4">
           <label className="block text-sm text-gray-400 mb-1">
             GPU メモリ利用率: {Math.round(form.gpu_memory_utilization * 100)}%
           </label>
@@ -166,6 +167,34 @@ export default function ServerControl({
             className="w-full accent-accent-primary"
           />
         </div>
+
+        {/* テンソル並列数 */}
+        <div className="mb-4">
+          <label className="block text-sm text-gray-400 mb-1">
+            テンソル並列数: {form.tensor_parallel_size}
+          </label>
+          <input
+            type="range"
+            min="1"
+            max="8"
+            step="1"
+            value={form.tensor_parallel_size}
+            onChange={(e) => setForm({ ...form, tensor_parallel_size: parseInt(e.target.value) })}
+            disabled={isBusy}
+            className="w-full accent-accent-primary"
+          />
+        </div>
+
+        {/* ダウンロード制御 */}
+        <label className="mb-6 flex items-center gap-2 text-sm text-gray-400">
+          <input
+            type="checkbox"
+            checked={form.download_model}
+            onChange={(e) => setForm({ ...form, download_model: e.target.checked })}
+            disabled={isBusy}
+          />
+          起動前にモデルキャッシュを確認/ダウンロードする
+        </label>
 
         {/* ボタン */}
         <div className="flex gap-3">

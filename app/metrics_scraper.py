@@ -8,28 +8,25 @@ WebSocket 経由でリアルタイムデータを配信する。
 import asyncio
 import time
 import httpx
-from typing import Dict, List, Optional
+from typing import Awaitable, Callable, Optional
 from collections import deque
 
 
 class MetricsScraper:
     """vLLM Prometheus metrics のスクラッパー。"""
 
-    def __init__(self, vllm_metrics_url: str = "http://localhost:8001/metrics", scrape_interval: float = 5.0):
+    def __init__(
+        self,
+        vllm_metrics_url: str = "http://localhost:8001/metrics",
+        scrape_interval: float = 5.0,
+        event_publisher: Callable[..., Awaitable[dict]] | None = None,
+    ):
         self.metrics_url = vllm_metrics_url
         self.scrape_interval = scrape_interval
-        self.clients: List[asyncio.websocket.WebSocket] = []
         self._running = False
         self._task: Optional[asyncio.Task] = None
         self._history = deque(maxlen=100)  # 直近100回のメトリクス履歴
-
-    def register_client(self, ws) -> None:
-        if ws not in self.clients:
-            self.clients.append(ws)
-
-    def unregister_client(self, ws) -> None:
-        if ws in self.clients:
-            self.clients.remove(ws)
+        self.event_publisher = event_publisher
 
     async def start(self) -> None:
         if not self._running:
@@ -52,10 +49,9 @@ class MetricsScraper:
                 metrics = await self._fetch_metrics()
                 if metrics:
                     self._history.append(metrics)
-                    await self._broadcast(metrics)
+                    await self._publish("metrics", metrics)
             except Exception as e:
-                error_msg = {"type": "error", "message": f"Metrics scrape failed: {str(e)}"}
-                await self._broadcast(error_msg)
+                await self._publish("error", message=f"Metrics scrape failed: {str(e)}")
             await asyncio.sleep(self.scrape_interval)
 
     async def _fetch_metrics(self) -> Optional[dict]:
@@ -146,17 +142,9 @@ class MetricsScraper:
 
         return metrics
 
-    async def _broadcast(self, data: dict) -> None:
-        """全クライアントにデータをブロードキャストする。"""
-        dead_clients = []
-        for client in self.clients:
-            try:
-                await client.send_json(data)
-            except Exception:
-                dead_clients.append(client)
-
-        for dead in dead_clients:
-            self.unregister_client(dead)
+    async def _publish(self, event_type: str, data: dict | None = None, message: str | None = None) -> None:
+        if self.event_publisher:
+            await self.event_publisher(event_type, data, message=message)
 
     def get_history(self, count: int = 20) -> list:
         return list(self._history)[-count:]

@@ -4,15 +4,27 @@ services:
     build:
       context: .
       dockerfile: Dockerfile.backend
+      args:
+        - HTTP_PROXY=${HTTP_PROXY}
+        - HTTPS_PROXY=${HTTPS_PROXY}
+        - NO_PROXY=${NO_PROXY}
     container_name: vllm-manager-backend
     ports:
-      - "${BACKEND_PORT:-8000}:8000"
+      - "${BACKEND_PORT:-18000}:8000"
+      - "${VLLM_HOST_PORT:-18001}:${VLLM_PORT:-8001}"
     volumes:
       - vllm-data:/app/data
       - hf-cache:/root/.cache/huggingface
     environment:
       - VLLM_PORT=${VLLM_PORT:-8001}
       - HF_HOME=/root/.cache/huggingface
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HUGGINGFACE_HUB_TOKEN=${HF_TOKEN:-}
+      - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-vllm-default-key}
+      - LITELLM_INTERNAL_URL=http://litellm:4000
+      - VLLM_MANAGER_ADMIN_USER=${VLLM_MANAGER_ADMIN_USER:-admin}
+      - VLLM_MANAGER_ADMIN_PASSWORD=${VLLM_MANAGER_ADMIN_PASSWORD:-admin}
+      - VLLM_MANAGER_DATA_DIR=/app/data
     deploy:
       resources:
         reservations:
@@ -30,15 +42,77 @@ services:
       retries: 3
 
   # === vLLM サーバー (バックエンドが管理) ===
-  # このサービスは直接起動せず、FastAPI から subprocess で制御される
-  # GPU コンテナとして定義するだけ
+  # Qwen3.5 FP8 を直接公開する場合のサービス
+  vllm:
+    image: vllm/vllm-openai:latest
+    container_name: vllm-manager-vllm
+    profiles:
+      - standalone-vllm
+    restart: unless-stopped
+    ipc: host
+    shm_size: 16gb
+    ports:
+      - "${VLLM_HOST_PORT:-18001}:${VLLM_PORT:-8001}"
+    volumes:
+      - hf-cache:/workspace/hf_cache
+    environment:
+      - HF_HOME=/workspace/hf_cache
+      - HUGGINGFACE_HUB_CACHE=/workspace/hf_cache/hub
+      - HF_TOKEN=${HF_TOKEN:-}
+      - HUGGINGFACE_HUB_TOKEN=${HF_TOKEN:-}
+      - FLASHINFER_DISABLE_VERSION_CHECK=1
+      - HTTP_PROXY=${HTTP_PROXY}
+      - HTTPS_PROXY=${HTTPS_PROXY}
+      - http_proxy=${HTTP_PROXY}
+      - https_proxy=${HTTPS_PROXY}
+      - NO_PROXY=${NO_PROXY}
+      - no_proxy=${NO_PROXY}
+      - MODEL_ID=${MODEL_ID:-lovedheart/Qwen3.5-9B-FP8}
+      - VLLM_HOST=0.0.0.0
+      - VLLM_PORT=${VLLM_PORT:-8001}
+      - TENSOR_PARALLEL_SIZE=${TENSOR_PARALLEL_SIZE:-1}
+      - MAX_MODEL_LEN=${MAX_MODEL_LEN:-131072}
+      - GPU_MEMORY_UTILIZATION=${GPU_MEMORY_UTILIZATION:-0.92}
+      - DOWNLOAD_WORKERS=${DOWNLOAD_WORKERS:-8}
+      - TRUST_REMOTE_CODE=${TRUST_REMOTE_CODE:-0}
+      - SERVED_MODEL_NAME=${SERVED_MODEL_NAME:-Qwen3.5-9B-FP8}
+      - VLLM_EXTRA_ARGS=${VLLM_EXTRA_ARGS:-}
+    command: >
+      --host ${VLLM_HOST:-0.0.0.0}
+      --port ${VLLM_PORT:-8001}
+      --model ${MODEL_ID:-lovedheart/Qwen3.5-9B-FP8}
+      --tensor-parallel-size ${TENSOR_PARALLEL_SIZE:-1}
+      --max-model-len ${MAX_MODEL_LEN:-131072}
+      --gpu-memory-utilization ${GPU_MEMORY_UTILIZATION:-0.92}
+      --download-dir /workspace/hf_cache
+      --served-model-name ${SERVED_MODEL_NAME:-Qwen3.5-9B-FP8}
+      ${VLLM_EXTRA_ARGS:-}
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:${VLLM_PORT:-8001}/v1/models', timeout=5).read()\"",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 20
+      start_period: 5m
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${GPU_COUNT:-all}
+              capabilities: [gpu]
+    networks:
+      - vllm-net
 
   # === LiteLLM プロキシ ===
   litellm:
     image: ghcr.io/berriai/litellm:main-stable
     container_name: vllm-manager-litellm
     ports:
-      - "4000:4000"
+      - "${LITELLM_PORT:-14000}:4000"
     volumes:
       - ./config/litellm_config.yaml:/app/config.yaml
     command: >
@@ -48,15 +122,34 @@ services:
       --detailed_debug
     environment:
       - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-vllm-default-key}
-      - VLLM_API_BASE=http://vllm:8001
+      - VLLM_API_BASE=http://backend:8001
+      - DATABASE_URL=postgresql://${LITELLM_DB_USER:-litellm}:${LITELLM_DB_PASSWORD:-litellm}@litellm-db:5432/${LITELLM_DB_NAME:-litellm}
+      - UI_USERNAME=${LITELLM_UI_USERNAME:-admin}
+      - UI_PASSWORD=${LITELLM_UI_PASSWORD:-admin}
     networks:
       - vllm-net
     restart: unless-stopped
+    depends_on:
+      - litellm-db
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:4000/health"]
       interval: 30s
       timeout: 5s
       retries: 3
+
+  # === LiteLLM 永続 DB ===
+  litellm-db:
+    image: postgres:16-alpine
+    container_name: vllm-manager-litellm-db
+    environment:
+      - POSTGRES_USER=${LITELLM_DB_USER:-litellm}
+      - POSTGRES_PASSWORD=${LITELLM_DB_PASSWORD:-litellm}
+      - POSTGRES_DB=${LITELLM_DB_NAME:-litellm}
+    volumes:
+      - litellm-db:/var/lib/postgresql/data
+    networks:
+      - vllm-net
+    restart: unless-stopped
 
   # === フロントエンド (Next.js) ===
   frontend:
@@ -64,11 +157,14 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       args:
+        - HTTP_PROXY=${HTTP_PROXY}
+        - HTTPS_PROXY=${HTTPS_PROXY}
+        - NO_PROXY=${NO_PROXY}
         - NEXT_PUBLIC_API_URL=http://localhost:8000
         - NEXT_PUBLIC_LITELLM_URL=http://localhost:4000
     container_name: vllm-manager-frontend
     ports:
-      - "${FRONTEND_PORT:-3000}:3000"
+      - "${FRONTEND_PORT:-13000}:3000"
     environment:
       - NEXT_PUBLIC_API_URL=http://backend:8000
       - NEXT_PUBLIC_LITELLM_URL=http://litellm:4000
@@ -83,6 +179,8 @@ volumes:
   vllm-data:
     driver: local
   hf-cache:
+    driver: local
+  litellm-db:
     driver: local
 
 networks:

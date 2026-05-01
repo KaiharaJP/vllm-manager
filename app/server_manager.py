@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Optional
 
 # --- パス設定 (Docker 内で共有) ---
-DATA_DIR = Path("/app/data")
+DATA_DIR = Path(os.environ.get("VLLM_MANAGER_DATA_DIR", "/tmp/vllm-manager-data"))
 PID_FILE = DATA_DIR / "vllm.pid"
 LOG_FILE = DATA_DIR / "vllm.log"
 CONFIG_FILE = DATA_DIR / "config.json"

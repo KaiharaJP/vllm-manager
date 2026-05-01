@@ -1,13 +1,15 @@
 "use client";
 
-import type { ServerStatus } from "@/types";
-import { Activity, Power, Shield } from "lucide-react";
+import type { AppUser, ServerStatus } from "@/types";
+import { Activity, Shield } from "lucide-react";
 
 interface HeaderProps {
   status: ServerStatus | null;
+  user: AppUser;
+  onLogout: () => void;
 }
 
-export default function Header({ status }: HeaderProps) {
+export default function Header({ status, user, onLogout }: HeaderProps) {
   const isHealthy = status?.healthy ?? false;
   const isRunning = status?.running ?? false;
 
@@ -45,6 +47,16 @@ export default function Header({ status }: HeaderProps) {
               {status.model}
             </div>
           )}
+          <div className="flex items-center gap-2 text-sm text-gray-400">
+            <Shield className="w-4 h-4" />
+            <span>{user.username} / {user.role}</span>
+          </div>
+          <button
+            onClick={onLogout}
+            className="text-sm text-gray-400 hover:text-white"
+          >
+            Logout
+          </button>
         </div>
       </div>
     </header>

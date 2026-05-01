@@ -4,7 +4,7 @@
 model_list:
   - litellm_params:
       model: vllm
-      api_base: http://vllm:8001
+      api_base: http://backend:8001
       api_key: ""
       rpm: 10000
       pass_through_optional_params: true

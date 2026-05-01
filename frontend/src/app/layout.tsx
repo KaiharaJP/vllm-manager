@@ -1,6 +1,5 @@
 import type { Metadata } from "next";
 import "@/app/globals.css";
-import Dashboard from "@/components/Dashboard";
 
 export const metadata: Metadata = {
   title: "vLLM Manager",

@@ -6,16 +6,27 @@ import MetricsPanel from "@/components/MetricsPanel";
 import ConfigPanel from "@/components/ConfigPanel";
 import LogPanel from "@/components/LogPanel";
 import Header from "@/components/Header";
+import ModelManagement from "@/components/ModelManagement";
+import LiteLLMAdminPanel from "@/components/LiteLLMAdminPanel";
+import UsagePanel from "@/components/UsagePanel";
 import { api } from "@/lib/api";
-import type { ServerStatus, Model, ServerConfig, ContextPreset } from "@/types";
+import type { AppUser, DownloadJob, ServerStatus, Model, ServerConfig, ContextPreset } from "@/types";
 
-export default function Dashboard() {
+interface DashboardProps {
+  currentUser: AppUser;
+  onLogout: () => void;
+}
+
+type TabKey = "control" | "metrics" | "models" | "litellm" | "usage" | "config" | "log";
+
+export default function Dashboard({ currentUser, onLogout }: DashboardProps) {
   const [status, setStatus] = useState<ServerStatus | null>(null);
   const [config, setConfig] = useState<ServerConfig | null>(null);
   const [models, setModels] = useState<Model[]>([]);
+  const [jobs, setJobs] = useState<DownloadJob[]>([]);
   const [contextPresets, setContextPresets] = useState<ContextPreset[]>([]);
   const [loading, setLoading] = useState(true);
-  const [activeTab, setActiveTab] = useState<"control" | "metrics" | "config" | "log">("control");
+  const [activeTab, setActiveTab] = useState<TabKey>(currentUser.role === "admin" ? "control" : "metrics");
 
   useEffect(() => {
     loadInitialData();
@@ -25,16 +36,18 @@ export default function Dashboard() {
 
   async function loadInitialData() {
     try {
-      const [statusData, configData, modelsData, presetsData] = await Promise.all([
+      const [statusData, configData, modelsData, presetsData, jobsData] = await Promise.all([
         api.getStatus(),
         api.getConfig(),
         api.getModels(),
         api.getContextPresets(),
+        currentUser.role === "admin" ? api.getModelDownloads() : Promise.resolve([]),
       ]);
       setStatus(statusData);
       setConfig(configData);
       setModels(modelsData);
       setContextPresets(presetsData);
+      setJobs(jobsData);
     } catch (err) {
       console.error("Failed to load initial data:", err);
     } finally {
@@ -51,6 +64,15 @@ export default function Dashboard() {
     }
   }
 
+  async function refreshModels() {
+    const [modelsData, jobsData] = await Promise.all([
+      api.getModels(),
+      currentUser.role === "admin" ? api.getModelDownloads() : Promise.resolve([]),
+    ]);
+    setModels(modelsData);
+    setJobs(jobsData);
+  }
+
   if (loading) {
     return (
       <div className="flex items-center justify-center min-h-screen">
@@ -64,17 +86,24 @@ export default function Dashboard() {
 
   return (
     <div className="min-h-screen bg-bg-primary">
-      <Header status={status} />
+      <Header status={status} user={currentUser} onLogout={onLogout} />
 
       {/* タブナビゲーション */}
       <nav className="sticky top-0 z-10 bg-bg-secondary/80 backdrop-blur-sm border-b border-white/5">
         <div className="max-w-7xl mx-auto px-4">
           <div className="flex gap-1">
             {([
-              { key: "control", label: "サーバー管理" },
+              ...(currentUser.role === "admin" ? [
+                { key: "control", label: "サーバー管理" },
+              ] as const : []),
               { key: "metrics", label: "モニタリング" },
-              { key: "config", label: "設定" },
-              { key: "log", label: "ログ" },
+              ...(currentUser.role === "admin" ? [
+                { key: "models", label: "モデル管理" },
+                { key: "litellm", label: "ユーザー/APIキー" },
+                { key: "usage", label: "利用状況" },
+                { key: "config", label: "設定" },
+                { key: "log", label: "ログ" },
+              ] as const : []),
             ] as const).map((tab) => (
               <button
                 key={tab.key}
@@ -94,7 +123,7 @@ export default function Dashboard() {
 
       {/* コンテンツ */}
       <main className="max-w-7xl mx-auto px-4 py-6">
-        {activeTab === "control" && (
+        {activeTab === "control" && currentUser.role === "admin" && (
           <ServerControl
             status={status}
             config={config}
@@ -104,14 +133,19 @@ export default function Dashboard() {
           />
         )}
         {activeTab === "metrics" && <MetricsPanel />}
-        {activeTab === "config" && (
+        {activeTab === "models" && currentUser.role === "admin" && (
+          <ModelManagement models={models} jobs={jobs} onChanged={refreshModels} />
+        )}
+        {activeTab === "litellm" && currentUser.role === "admin" && <LiteLLMAdminPanel />}
+        {activeTab === "usage" && currentUser.role === "admin" && <UsagePanel />}
+        {activeTab === "config" && currentUser.role === "admin" && (
           <ConfigPanel
             config={config}
             models={models}
             contextPresets={contextPresets}
           />
         )}
-        {activeTab === "log" && <LogPanel />}
+        {activeTab === "log" && currentUser.role === "admin" && <LogPanel />}
       </main>
     </div>
   );

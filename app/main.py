@@ -5,38 +5,81 @@ API エンドポイント + WebSocket メトリクス配信を提供する。
 """
 
 import os
+import json
+from urllib.parse import urlencode
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect, APIRouter, HTTPException
+from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect, APIRouter, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
+import httpx
 
 from app.server_manager import (
     get_status,
     start_server,
     stop_server,
+    stop_server_by_pid,
     restart_server,
     get_log_lines,
     get_context_presets,
+    list_running_servers,
     load_config,
 )
-from app.auth import authenticate, create_session, get_current_user, load_users, public_user, require_admin, upsert_user
+from app.system_metrics import get_system_metrics
+from app.auth import (
+    authenticate,
+    create_session,
+    get_current_user,
+    load_users,
+    public_user,
+    require_admin,
+    upsert_user,
+    update_user,
+)
 from app.event_bus import event_bus
 from app.litellm_client import litellm_request, status as litellm_status
-from app.model_manager import load_jobs, load_model_catalog, save_model, start_download_job
+from app.model_manager import (
+    cancel_active_download_jobs,
+    delete_model,
+    delete_model_cache,
+    load_jobs,
+    load_model_catalog,
+    save_model,
+    start_download_job,
+)
 from app.metrics_scraper import MetricsScraper
+from app.litellm_request_track import header_marks_litellm, proxy_litellm_tracked_v1, snapshot as litellm_proxy_snapshot
+
+BACKEND_INTERNAL_PORT = int(os.environ.get("BACKEND_INTERNAL_PORT", "8000"))
+
+
+def _is_backend_self_port(port: Any) -> bool:
+    try:
+        return int(port) == BACKEND_INTERNAL_PORT
+    except Exception:
+        return False
 
 
 # --- Pydantic モデル ---
 
 class ServerStartRequest(BaseModel):
     model_id: str
-    context_length: int = Field(default=8192, ge=1024, le=131072)
-    max_num_seqs: int = Field(default=256, ge=1, le=1024)
-    gpu_memory_utilization: float = Field(default=0.9, ge=0.1, le=1.0)
+    context_length: int = Field(default=8192, ge=1024, le=262144)
+    max_num_seqs: int = Field(default=1, ge=1, le=20)
+    default_max_tokens: int = Field(default=512, ge=1, le=262144)
+    default_temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    default_top_p: float = Field(default=0.95, ge=0.0, le=1.0)
+    default_frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
+    default_presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
+    gpu_memory_mode: str = Field(default="auto", pattern="^(auto|manual)$")
+    gpu_memory_utilization: float = Field(default=0.85, ge=0.1, le=1.0)
     tensor_parallel_size: int = Field(default=1, ge=1, le=8)
+    gpu_devices: str = "all"
+    speculative_config: dict[str, Any] = Field(default_factory=dict)
     download_model: bool = True
+    enable_auto_tool_choice: bool = False
+    tool_call_parser: str = ""
 
 
 class ServerStatusResponse(BaseModel):
@@ -54,6 +97,10 @@ class ApiResponse(BaseModel):
     steps: list[str] = Field(default_factory=list)
 
 
+class StopServerByPidRequest(BaseModel):
+    pid: int = Field(ge=1)
+
+
 class LoginRequest(BaseModel):
     username: str
     password: str
@@ -65,6 +112,54 @@ class UserCreateRequest(BaseModel):
     role: str = Field(default="user", pattern="^(admin|user)$")
     litellm_user_id: Optional[str] = None
     litellm_team_id: Optional[str] = None
+
+
+class UserUpdateRequest(BaseModel):
+    password: Optional[str] = None
+    role: Optional[str] = Field(default=None, pattern="^(admin|user)$")
+    litellm_user_id: Optional[str] = None
+    litellm_team_id: Optional[str] = None
+    disabled: Optional[bool] = None
+
+
+class SelfUserUpdateRequest(BaseModel):
+    password: Optional[str] = None
+    litellm_team_id: Optional[str] = None
+
+
+class SelfApiKeyRequest(BaseModel):
+    models: list[str] = Field(default_factory=lambda: ["vllm-local"])
+    max_budget: Optional[float] = None
+    budget_duration: Optional[str] = None
+    rpm_limit: Optional[int] = None
+    tpm_limit: Optional[int] = None
+
+
+class AdminUserApiKeyRequest(BaseModel):
+    models: list[str] = Field(default_factory=lambda: ["vllm-local"])
+    max_budget: Optional[float] = None
+    budget_duration: Optional[str] = None
+    rpm_limit: Optional[int] = None
+    tpm_limit: Optional[int] = None
+
+
+async def _litellm_list_keys_detailed() -> list[dict[str, Any]]:
+    """Return detailed key info entries via /key/list + /key/info."""
+    from urllib.parse import quote
+
+    data = await litellm_request("GET", "/key/list")
+    raw_keys = data.get("keys", []) if isinstance(data, dict) else data
+    if not isinstance(raw_keys, list):
+        return []
+
+    detailed: list[dict[str, Any]] = []
+    for k in raw_keys:
+        if not isinstance(k, str):
+            continue
+        info = await litellm_request("GET", f"/key/info?key={quote(k)}")
+        if isinstance(info, dict):
+            detailed.append(info)
+    return detailed
 
 
 class ModelRegisterRequest(BaseModel):
@@ -81,6 +176,7 @@ class ModelRegisterRequest(BaseModel):
 
 class DownloadRequest(BaseModel):
     model_id: str
+    force: bool = False
 
 
 class LiteLLMProxyRequest(BaseModel):
@@ -144,6 +240,102 @@ async def api_me(user: dict = Depends(get_current_user)):
     return user
 
 
+@router.patch("/api/auth/me")
+async def api_update_me(req: SelfUserUpdateRequest, user: dict = Depends(get_current_user)):
+    fields = req.model_dump(exclude_unset=True)
+    if not fields:
+        raise HTTPException(status_code=400, detail="No fields to update")
+    try:
+        return update_user(
+            user["username"],
+            password=fields.get("password"),
+            litellm_team_id=fields.get("litellm_team_id"),
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/api/auth/me/api-keys")
+async def api_my_litellm_keys(user: dict = Depends(get_current_user)):
+    user_id = user.get("litellm_user_id") or user["username"]
+    team_id = user.get("litellm_team_id")
+    detailed = await _litellm_list_keys_detailed()
+    keys = []
+    for entry in detailed:
+        info = entry.get("info", {})
+        if not isinstance(info, dict):
+            continue
+        if info.get("user_id") == user_id or (team_id and info.get("team_id") == team_id):
+            keys.append(entry)
+    return {"keys": keys, "count": len(keys)}
+
+
+@router.post("/api/auth/me/api-keys")
+async def api_my_litellm_create_key(req: SelfApiKeyRequest, user: dict = Depends(get_current_user)):
+    payload: dict[str, Any] = {
+        "user_id": user.get("litellm_user_id") or user["username"],
+        "team_id": user.get("litellm_team_id") or None,
+        "models": req.models or ["vllm-local"],
+    }
+    if req.max_budget is not None:
+        payload["max_budget"] = req.max_budget
+    if req.budget_duration:
+        payload["budget_duration"] = req.budget_duration
+    if req.rpm_limit is not None:
+        payload["rpm_limit"] = req.rpm_limit
+    if req.tpm_limit is not None:
+        payload["tpm_limit"] = req.tpm_limit
+    data = await litellm_request("POST", "/key/generate", payload)
+    await event_bus.publish("litellm_key_updated", data, message="self key generated", actor=user["username"])
+    return data
+
+
+@router.get("/api/users/{username}/api-keys")
+async def api_user_litellm_keys(username: str, admin: dict = Depends(require_admin)):
+    users = load_users()
+    if username not in users:
+        raise HTTPException(status_code=404, detail="User not found")
+    u = public_user(users[username])
+    user_id = u.get("litellm_user_id") or u["username"]
+    team_id = u.get("litellm_team_id")
+
+    detailed = await _litellm_list_keys_detailed()
+    keys = []
+    for entry in detailed:
+        info = entry.get("info", {})
+        if not isinstance(info, dict):
+            continue
+        if info.get("user_id") == user_id or (team_id and info.get("team_id") == team_id):
+            keys.append(entry)
+    return {"keys": keys, "count": len(keys), "user_id": user_id, "team_id": team_id}
+
+
+@router.post("/api/users/{username}/api-keys")
+async def api_user_litellm_create_key(username: str, req: AdminUserApiKeyRequest, admin: dict = Depends(require_admin)):
+    users = load_users()
+    if username not in users:
+        raise HTTPException(status_code=404, detail="User not found")
+    u = public_user(users[username])
+    payload: dict[str, Any] = {
+        "user_id": u.get("litellm_user_id") or u["username"],
+        "team_id": u.get("litellm_team_id") or None,
+        "models": req.models or ["vllm-local"],
+    }
+    if req.max_budget is not None:
+        payload["max_budget"] = req.max_budget
+    if req.budget_duration:
+        payload["budget_duration"] = req.budget_duration
+    if req.rpm_limit is not None:
+        payload["rpm_limit"] = req.rpm_limit
+    if req.tpm_limit is not None:
+        payload["tpm_limit"] = req.tpm_limit
+    data = await litellm_request("POST", "/key/generate", payload)
+    await event_bus.publish("litellm_key_updated", data, message="user key generated", actor=admin["username"])
+    return data
+
+
 @router.get("/api/users")
 async def api_users(_: dict = Depends(require_admin)):
     return [public_user(user) for user in load_users().values()]
@@ -164,6 +356,26 @@ async def api_create_user(req: UserCreateRequest, admin: dict = Depends(require_
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+
+@router.patch("/api/users/{username}")
+async def api_update_user(username: str, req: UserUpdateRequest, admin: dict = Depends(require_admin)):
+    try:
+        fields = req.model_dump(exclude_unset=True)
+        user = update_user(
+            username,
+            password=fields.get("password"),
+            role=fields.get("role"),
+            litellm_user_id=fields.get("litellm_user_id"),
+            litellm_team_id=fields.get("litellm_team_id"),
+            disabled=fields.get("disabled"),
+        )
+        await event_bus.publish("user_updated", user, message="user updated", actor=admin["username"])
+        return user
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
 @router.get("/api/status", response_model=ServerStatusResponse)
 async def api_status():
     """サーバーの現在状態を取得"""
@@ -180,9 +392,19 @@ async def api_start(req: ServerStartRequest, admin: dict = Depends(require_admin
         model_id=req.model_id,
         context_length=req.context_length,
         max_num_seqs=req.max_num_seqs,
+        default_max_tokens=req.default_max_tokens,
+        default_temperature=req.default_temperature,
+        default_top_p=req.default_top_p,
+        default_frequency_penalty=req.default_frequency_penalty,
+        default_presence_penalty=req.default_presence_penalty,
+        gpu_memory_mode=req.gpu_memory_mode,
         gpu_memory_utilization=req.gpu_memory_utilization,
         tensor_parallel_size=req.tensor_parallel_size,
+        gpu_devices=req.gpu_devices,
+        speculative_config=req.speculative_config,
         download_model=req.download_model,
+        enable_auto_tool_choice=req.enable_auto_tool_choice,
+        tool_call_parser=req.tool_call_parser,
     )
     await event_bus.publish(
         "server_job",
@@ -199,6 +421,20 @@ async def api_stop(admin: dict = Depends(require_admin)):
     result = stop_server()
     await event_bus.publish("server_job", {"status": "stopped", "result": result}, message=result["message"], actor=admin["username"])
     return ApiResponse(success=result["success"], message=result["message"])
+
+
+@router.get("/api/servers")
+async def api_servers(_: dict = Depends(require_admin)):
+    """起動中の vLLM サーバー一覧を取得"""
+    return list_running_servers()
+
+
+@router.post("/api/servers/stop")
+async def api_stop_server_by_pid(req: StopServerByPidRequest, admin: dict = Depends(require_admin)):
+    """指定 PID の vLLM サーバーを停止"""
+    result = stop_server_by_pid(req.pid)
+    await event_bus.publish("server_job", {"status": "stopped", "result": result}, message=result["message"], actor=admin["username"])
+    return result
 
 
 @router.post("/api/restart")
@@ -221,6 +457,12 @@ async def api_config():
     return load_config()
 
 
+@router.get("/api/system-metrics")
+async def api_system_metrics():
+    """ホストのシステム使用率を取得"""
+    return get_system_metrics()
+
+
 @router.get("/api/log")
 async def api_log(tail: int = 100, _: dict = Depends(require_admin)):
     """vLLM サーバーのログを取得"""
@@ -240,6 +482,20 @@ async def api_register_model(req: ModelRegisterRequest, admin: dict = Depends(re
     return model
 
 
+@router.delete("/api/models/{model_id:path}/cache")
+async def api_delete_model_cache(model_id: str, admin: dict = Depends(require_admin)):
+    result = delete_model_cache(model_id)
+    await event_bus.publish("model_download", result, message="model cache removed", actor=admin["username"])
+    return result
+
+
+@router.delete("/api/models/{model_id:path}")
+async def api_delete_model(model_id: str, admin: dict = Depends(require_admin)):
+    result = delete_model(model_id)
+    await event_bus.publish("model_registered", result, message="model removed", actor=admin["username"])
+    return result
+
+
 @router.get("/api/model-downloads")
 async def api_model_downloads(_: dict = Depends(require_admin)):
     return load_jobs()
@@ -248,9 +504,14 @@ async def api_model_downloads(_: dict = Depends(require_admin)):
 @router.post("/api/model-downloads")
 async def api_start_model_download(req: DownloadRequest, admin: dict = Depends(require_admin)):
     try:
-        return await start_download_job(req.model_id, actor=admin["username"])
+        return await start_download_job(req.model_id, actor=admin["username"], force=req.force)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/api/model-downloads/cancel")
+async def api_cancel_model_download(req: DownloadRequest, admin: dict = Depends(require_admin)):
+    return await cancel_active_download_jobs(req.model_id, actor=admin["username"])
 
 
 @router.get("/api/context-presets")
@@ -273,6 +534,7 @@ async def websocket_metrics(ws: WebSocket):
         history = metrics_scraper.get_history(count=10) if metrics_scraper else []
         if history:
             await ws.send_json({"type": "history", "data": history})
+        await ws.send_json({"type": "litellm_proxy_snapshot", "data": {"requests": litellm_proxy_snapshot()}})
 
         while True:
             # クライアントからのメッセージを待機（ping 用）
@@ -353,3 +615,180 @@ async def api_litellm_spend(_: dict = Depends(require_admin)):
 
 
 app.include_router(router)
+
+
+# --- OpenAI互換プロキシ ---
+# Docker内で vLLM が 8006 など動的ポート起動しても、
+# 外部からは backend(:18000) の /v1/* で常にアクセスできるようにする。
+def _normalize_model_id(value: Any) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip().lower()
+
+
+def _is_alias_model(value: str) -> bool:
+    return value in {"", "vllm-local", "vllm-any", "auto"}
+
+
+def _pick_target_server(requested_model: str, servers: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    normalized = _normalize_model_id(requested_model)
+    candidates = [s for s in servers if s.get("port")]
+    if not candidates:
+        return None
+
+    if not _is_alias_model(normalized):
+        for server in candidates:
+            server_model = _normalize_model_id(server.get("model"))
+            if not server_model:
+                continue
+            if normalized == server_model:
+                return server
+            if "/" in server_model and normalized == server_model.split("/")[-1]:
+                return server
+            if "/" in normalized and normalized.split("/")[-1] == server_model.split("/")[-1]:
+                return server
+
+    managed = next((s for s in candidates if s.get("managed_by_app")), None)
+    if managed:
+        return managed
+    return sorted(candidates, key=lambda s: int(s.get("port") or 0))[0]
+
+
+@app.api_route("/v1/{subpath:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
+async def proxy_openai_compat(subpath: str, request: Request):
+    body = await request.body()
+    method = request.method.upper()
+    servers = list_running_servers()
+    # 再帰防止: backend 自身の listen port(既定 8000)は上流候補から除外
+    active_servers = [s for s in servers if s.get("port") and not _is_backend_self_port(s.get("port"))]
+    status = get_status()
+
+    if not active_servers and (not status.get("running") or not status.get("vllm_port")):
+        raise HTTPException(status_code=503, detail="vLLM server is not running")
+
+    if method == "GET" and subpath == "models":
+        timeout = httpx.Timeout(30.0, connect=5.0)
+        all_models: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        # /v1/models は自己再帰ポートを除外した上で、検出された vLLM を集約する。
+        ports = sorted({int(s["port"]) for s in active_servers if s.get("port") is not None})
+        if not ports and status.get("vllm_port"):
+            status_port = int(status["vllm_port"])
+            ports = [status_port] if not _is_backend_self_port(status_port) else []
+        try:
+            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+                for port in ports:
+                    try:
+                        upstream = await client.get(f"http://127.0.0.1:{port}/v1/models")
+                        upstream.raise_for_status()
+                        payload = upstream.json()
+                        for entry in payload.get("data", []) if isinstance(payload, dict) else []:
+                            model_id = str(entry.get("id", ""))
+                            if not model_id or model_id in seen:
+                                continue
+                            seen.add(model_id)
+                            all_models.append(entry)
+                    except Exception:
+                        continue
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            raise HTTPException(status_code=503, detail="vLLM upstream is unavailable")
+        return Response(
+            content=json.dumps({"object": "list", "data": all_models}).encode("utf-8"),
+            media_type="application/json",
+            status_code=200,
+        )
+
+    request_payload: Optional[dict[str, Any]] = None
+    requested_model = ""
+    if method in {"POST", "PUT", "PATCH"} and body:
+        try:
+            parsed = json.loads(body.decode("utf-8"))
+            if isinstance(parsed, dict):
+                request_payload = parsed
+                requested_model = str(parsed.get("model") or "")
+        except Exception:
+            request_payload = None
+
+    target_server = _pick_target_server(requested_model, active_servers)
+    if target_server is None and status.get("vllm_port"):
+        target_port = int(status["vllm_port"])
+        target_model = None
+    elif target_server is not None:
+        target_port = int(target_server["port"])
+        target_model = target_server.get("model")
+    else:
+        raise HTTPException(status_code=503, detail="No active vLLM server found")
+
+    if request_payload is not None and subpath in {"chat/completions", "completions"}:
+        if target_model and _is_alias_model(_normalize_model_id(requested_model)):
+            request_payload["model"] = target_model
+        cfg = load_config()
+        defaults = {
+            "max_tokens": int(cfg.get("default_max_tokens", 512)),
+            "temperature": float(cfg.get("default_temperature", 0.7)),
+            "top_p": float(cfg.get("default_top_p", 0.95)),
+            "frequency_penalty": float(cfg.get("default_frequency_penalty", 0.0)),
+            "presence_penalty": float(cfg.get("default_presence_penalty", 0.0)),
+        }
+        for key, value in defaults.items():
+            if request_payload.get(key) is None:
+                request_payload[key] = value
+        body = json.dumps(request_payload).encode("utf-8")
+
+    query_string = urlencode(list(request.query_params.multi_items()))
+    target = f"http://127.0.0.1:{target_port}/v1/{subpath}"
+    if query_string:
+        target = f"{target}?{query_string}"
+    forward_headers = {}
+    for key, value in request.headers.items():
+        lk = key.lower()
+        if lk in {"host", "content-length"}:
+            continue
+        forward_headers[key] = value
+
+    timeout = httpx.Timeout(300.0, connect=10.0)
+    # ローカル転送は環境プロキシを使わない（squid 経由で 127.0.0.1 が失敗するため）
+    if (
+        method == "POST"
+        and subpath in {"chat/completions", "completions"}
+        and body
+        and header_marks_litellm(request)
+    ):
+        try:
+            return await proxy_litellm_tracked_v1(
+                subpath=subpath,
+                target=target,
+                body=body,
+                forward_headers=forward_headers,
+                timeout=timeout,
+                request_payload=request_payload,
+            )
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            raise HTTPException(status_code=503, detail="vLLM upstream is unavailable") from None
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+            upstream = await client.request(
+                request.method,
+                target,
+                content=body if body else None,
+                headers=forward_headers,
+            )
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        # vLLM再起動直後などで接続不能な瞬間は 500 ではなく 503 を返す
+        raise HTTPException(status_code=503, detail="vLLM upstream is unavailable")
+
+    # hop-by-hop ヘッダ等は返却しない
+    response_headers = {}
+    for key, value in upstream.headers.items():
+        lk = key.lower()
+        if lk in {"content-length", "transfer-encoding", "connection", "content-encoding"}:
+            continue
+        response_headers[key] = value
+
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        headers=response_headers,
+        media_type=upstream.headers.get("content-type"),
+    )

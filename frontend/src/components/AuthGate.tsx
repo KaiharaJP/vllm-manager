@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
-import { api } from "@/lib/api";
+import { api, ApiRequestError } from "@/lib/api";
 import type { AppUser } from "@/types";
 
 interface AuthGateProps {
@@ -19,17 +19,35 @@ export default function AuthGate({ children }: AuthGateProps) {
   useEffect(() => {
     async function restore() {
       try {
+        setError(null);
         if (window.localStorage.getItem("vllm_manager_token")) {
           setUser(await api.me());
         }
-      } catch {
-        window.localStorage.removeItem("vllm_manager_token");
+      } catch (e) {
+        const status = e instanceof ApiRequestError ? e.status : undefined;
+        if (status === 401 || status === 403) {
+          window.localStorage.removeItem("vllm_manager_token");
+        }
+        const msg =
+          e instanceof ApiRequestError
+            ? e.message
+            : e instanceof Error
+              ? e.message
+              : String(e);
+        setError(msg);
       } finally {
         setLoading(false);
       }
     }
     restore();
   }, []);
+
+  /** AbortSignal が効かず fetch が固まる環境向けの最終手段 */
+  useEffect(() => {
+    if (!loading) return;
+    const t = window.setTimeout(() => setLoading(false), 32_000);
+    return () => window.clearTimeout(t);
+  }, [loading]);
 
   async function login() {
     setError(null);
@@ -39,7 +57,7 @@ export default function AuthGate({ children }: AuthGateProps) {
       window.localStorage.setItem("vllm_manager_token", result.token);
       setUser(result.user);
     } catch (err) {
-      setError(String(err));
+      setError(err instanceof ApiRequestError ? err.message : String(err));
     } finally {
       setLoading(false);
     }

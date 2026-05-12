@@ -16,6 +16,28 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 _sessions: dict[str, dict] = {}
 
 
+def _password_key(password: str) -> str:
+    """Normalize passwords before bcrypt so long secrets are supported."""
+    import hashlib
+
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(_password_key(password))
+
+
+def verify_password(password: str, password_hash: str) -> bool:
+    if pwd_context.verify(_password_key(password), password_hash):
+        return True
+
+    # Backwards compatibility for users created before password normalization.
+    try:
+        return pwd_context.verify(password, password_hash)
+    except ValueError:
+        return False
+
+
 def _ensure_data_dir() -> None:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -26,7 +48,7 @@ def _default_admin() -> dict:
     return {
         username: {
             "username": username,
-            "password_hash": pwd_context.hash(password),
+            "password_hash": hash_password(password),
             "role": "admin",
             "litellm_user_id": username,
             "litellm_team_id": "admins",
@@ -70,7 +92,7 @@ def authenticate(username: str, password: str) -> Optional[dict]:
     user = load_users().get(username)
     if not user or user.get("disabled"):
         return None
-    if not pwd_context.verify(password, user["password_hash"]):
+    if not verify_password(password, user["password_hash"]):
         return None
     return user
 
@@ -109,12 +131,13 @@ def upsert_user(
     litellm_user_id: str | None = None,
     litellm_team_id: str | None = None,
 ) -> dict:
+    """Create or replace a user. Always overwrites password."""
     if role not in {"admin", "user"}:
         raise ValueError("role must be admin or user")
     users = load_users()
     users[username] = {
         "username": username,
-        "password_hash": pwd_context.hash(password),
+        "password_hash": hash_password(password),
         "role": role,
         "litellm_user_id": litellm_user_id or username,
         "litellm_team_id": litellm_team_id,
@@ -123,3 +146,40 @@ def upsert_user(
     }
     save_users(users)
     return public_user(users[username])
+
+
+def update_user(
+    username: str,
+    *,
+    password: str | None = None,
+    role: str | None = None,
+    litellm_user_id: str | None = None,
+    litellm_team_id: str | None = None,
+    disabled: bool | None = None,
+) -> dict:
+    """Partially update an existing user."""
+    users = load_users()
+    if username not in users:
+        raise KeyError(f"user {username!r} not found")
+
+    user = users[username]
+
+    if role is not None:
+        if role not in {"admin", "user"}:
+            raise ValueError("role must be admin or user")
+        user["role"] = role
+
+    if password:
+        user["password_hash"] = hash_password(password)
+
+    if litellm_user_id is not None:
+        user["litellm_user_id"] = litellm_user_id
+
+    if litellm_team_id is not None:
+        user["litellm_team_id"] = litellm_team_id
+
+    if disabled is not None:
+        user["disabled"] = disabled
+
+    save_users(users)
+    return public_user(user)

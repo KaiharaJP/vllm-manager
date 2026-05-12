@@ -1,8 +1,8 @@
 "use client";
 
-import { useState } from "react";
+import { useState, type ReactNode } from "react";
 import type { ServerConfig, Model, ContextPreset } from "@/types";
-import { Settings, Key } from "lucide-react";
+import { Info, Key, Settings } from "lucide-react";
 
 interface ConfigPanelProps {
   config: ServerConfig | null;
@@ -22,18 +22,77 @@ export default function ConfigPanel({ config, models, contextPresets }: ConfigPa
           <Settings className="w-5 h-5 text-accent-primary" />
           現在設定
         </h2>
+        <p className="text-xs text-gray-500 mb-4">
+          「現在設定」は、最後にサーバー起動時に使われた設定値です。次回「サーバー管理」画面を開いたときの初期値にも使われます。各項目の（i）に、vLLM / OpenAI API との対応関係を載せています。
+        </p>
 
         {config && (
           <div className="space-y-3">
-            <ConfigRow label="モデル" value={config.model_id} />
-            <ConfigRow label="コンテキスト長" value={String(config.context_length)} />
-            <ConfigRow label="最大同時リクエスト" value={String(config.max_num_seqs)} />
+            <ConfigRow
+              label="モデル"
+              value={config.model_id}
+              hint="Hugging Face のモデル ID。`vllm serve` の引数になります。"
+            />
+            <ConfigRow
+              label="コンテキスト長"
+              value={String(config.context_length)}
+              hint="vLLM `--max-model-len`。KV キャッシュ規模に強く効く上限トークンです。"
+            />
+            <ConfigRow
+              label="最大同時リクエスト"
+              value={String(config.max_num_seqs)}
+              hint="vLLM `--max-num-seqs`。同時処理スロット数の上限です。"
+            />
+            <ConfigRow
+              label="デフォルト max_tokens"
+              value={String(config.default_max_tokens)}
+              hint="プロキシがリクエストに `max_tokens` が無いとき注入する値。"
+            />
+            <ConfigRow
+              label="デフォルト temperature"
+              value={String(config.default_temperature)}
+              hint="未指定時に注入する sampling temperature。"
+            />
+            <ConfigRow
+              label="デフォルト top_p"
+              value={String(config.default_top_p)}
+              hint="未指定時に注入する nucleus sampling の p。"
+            />
+            <ConfigRow
+              label="デフォルト frequency_penalty"
+              value={String(config.default_frequency_penalty)}
+              hint="未指定時に注入。繰り返し抑制（OpenAI 互換）。"
+            />
+            <ConfigRow
+              label="デフォルト presence_penalty"
+              value={String(config.default_presence_penalty)}
+              hint="未指定時に注入。話題の広がり（OpenAI 互換）。"
+            />
+            <ConfigRow
+              label="GPU メモリ設定モード"
+              value={config.gpu_memory_mode === "auto" ? "自動" : "手動"}
+              hint="自動時は起動前に空き VRAM から利用率を推定します。"
+            />
             <ConfigRow
               label="GPU メモリ利用率"
               value={`${Math.round(config.gpu_memory_utilization * 100)}%`}
+              hint="vLLM `--gpu-memory-utilization`。KV 等に使える VRAM 比率の上限イメージです。"
             />
-            <ConfigRow label="テンソル並列数" value={String(config.tensor_parallel_size)} />
-            <ConfigRow label="vLLM ポート" value={String(config.vllm_port)} />
+            <ConfigRow
+              label="テンソル並列数"
+              value={String(config.tensor_parallel_size)}
+              hint="vLLM `--tensor-parallel-size`。モデルを分割して載せる GPU 枚数です。"
+            />
+            <ConfigRow
+              label="使用GPU（保存値）"
+              value={config.gpu_devices || "all"}
+              hint="起動時に `CUDA_VISIBLE_DEVICES` へ渡した値の保存です。"
+            />
+            <ConfigRow
+              label="vLLM ポート"
+              value={String(config.vllm_port)}
+              hint="コンテナ内で vLLM が待ち受けるポート。このアプリが管理するプロセスの `--port` に対応します。"
+            />
           </div>
         )}
       </div>
@@ -139,11 +198,25 @@ export default function ConfigPanel({ config, models, contextPresets }: ConfigPa
   );
 }
 
-function ConfigRow({ label, value }: { label: string; value: string }) {
+function ConfigRow({ label, value, hint }: { label: string; value: string; hint: string }) {
   return (
-    <div className="flex justify-between items-center py-2 border-b border-white/5 last:border-0">
-      <span className="text-sm text-gray-400">{label}</span>
-      <span className="text-sm font-mono">{value}</span>
+    <div className="flex justify-between items-start gap-3 py-2 border-b border-white/5 last:border-0">
+      <span className="text-sm text-gray-400 flex items-start gap-1 shrink-0">
+        {label}
+        <InfoTooltip text={hint} />
+      </span>
+      <span className="text-sm font-mono text-right break-all max-w-[min(100%,20rem)]">{value}</span>
     </div>
+  );
+}
+
+function InfoTooltip({ text }: { text: ReactNode }) {
+  return (
+    <span className="group relative inline-flex shrink-0">
+      <Info className="h-4 w-4 cursor-help text-gray-500 transition-colors group-hover:text-accent-primary mt-0.5" />
+      <span className="pointer-events-none absolute left-0 top-6 z-30 hidden w-72 rounded-lg border border-white/10 bg-bg-primary p-3 text-xs font-normal leading-relaxed text-gray-300 shadow-xl group-hover:block">
+        {text}
+      </span>
+    </span>
   );
 }

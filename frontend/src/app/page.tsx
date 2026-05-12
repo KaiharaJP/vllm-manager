@@ -1,3 +1,5 @@
+"use client";
+
 import AuthGate from "@/components/AuthGate";
 import Dashboard from "@/components/Dashboard";
 

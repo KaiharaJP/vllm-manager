@@ -2,13 +2,30 @@
 # vLLM をバックエンドとして登録、API キー認証を有効化
 
 model_list:
-  - litellm_params:
-      model: vllm
-      api_base: http://backend:8001
-      api_key: ""
+  # 汎用ルーティング:
+  # - モデル名を固定せず、backend(/v1/*) 側で起動中 vLLM へ動的にルーティングする
+  # - 具体的なモデルIDをここに書かなくても、起動済みモデルへ転送される
+  - model_name: "vllm-local"
+    litellm_params:
+      model: openai/vllm-local
+      api_key: "sk-no-key-required"
+      api_base: http://backend:8000/v1
       rpm: 10000
       pass_through_optional_params: true
-    model_name: "vllm-local"
+      # vLLM Manager が /v1 プロキシで同時リクエスト・トークンを追跡するための識別子
+      extra_headers:
+        X-Vllm-Manager-Source: litellm
+  # Claude Code からの利用向けエイリアス
+  # - Claude Code の --model で指定しやすい名前を追加
+  - model_name: "claude-vllm-local"
+    litellm_params:
+      model: openai/vllm-local
+      api_key: "sk-no-key-required"
+      api_base: http://backend:8000/v1
+      rpm: 10000
+      pass_through_optional_params: true
+      extra_headers:
+        X-Vllm-Manager-Source: litellm
 
 # 環境変数で制御する項目
 # LITELLM_MASTER_KEY: sk-vllm-manager-xxxx  (API キー)

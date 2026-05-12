@@ -50,10 +50,24 @@ docker compose up -d --build
 
 アクセス先のデフォルトは次の通りです。
 
-- vLLM Manager UI: `http://localhost:13000`
-- FastAPI backend: `http://localhost:18000`
-- backend 管理 vLLM OpenAI API: `http://localhost:18001`
-- LiteLLM Proxy: `http://localhost:14000`
+- vLLM Manager UI: `http://hinton.prv.kanazawa-it.ac.jp:13000`
+- FastAPI backend: `http://hinton.prv.kanazawa-it.ac.jp:18000`
+- backend 管理 vLLM OpenAI API: `http://hinton.prv.kanazawa-it.ac.jp:18001`
+- LiteLLM Proxy: `http://hinton.prv.kanazawa-it.ac.jp:14000`
+
+### どのポートを使うべきか（重要）
+
+`18001` に統一されたわけではありません。用途ごとに入口が異なります。
+
+| 用途 | 推奨接続先 | 補足 |
+|------|------------|------|
+| OpenAI 形式を backend 経由で使う | `http://hinton.prv.kanazawa-it.ac.jp:18000/v1` | 管理アプリのプロキシを通る入口 |
+| OpenAI 形式を LiteLLM 経由で使う | `http://hinton.prv.kanazawa-it.ac.jp:14000/v1` | チーム運用・キー管理向け |
+| Claude Code（Anthropic 形式）で使う | `http://hinton.prv.kanazawa-it.ac.jp:14000` | `ANTHROPIC_BASE_URL` に設定 |
+| vLLM を直接叩く | `http://hinton.prv.kanazawa-it.ac.jp:18001/v1` | 直接接続。管理プロキシは経由しない |
+
+普段の運用は **`18000`（backend）または `14000`（LiteLLM）** を推奨します。  
+`18001` は「vLLM 直接接続」をしたいときだけ使ってください。
 
 初期ログインは `.env` の `VLLM_MANAGER_ADMIN_USER` / `VLLM_MANAGER_ADMIN_PASSWORD` です。デフォルトは `admin` / `admin` なので、実運用では必ず変更してください。
 
@@ -129,6 +143,20 @@ LiteLLM の virtual keys、users、teams、budgets、spend logs は `litellm-db`
 - `litellm-db`: LiteLLM の Postgres データ
 - ブラウザ `localStorage`: ログインセッション token のみ
 
+### モデルデータの実体パス
+
+モデル本体（Hugging Face キャッシュ）は `hf-cache` volume に保存されます。
+
+- backend コンテナ内: `/root/.cache/huggingface`
+- ホスト側実体: `/var/lib/docker/volumes/vllm-manager_hf-cache/_data`
+
+主な配置例:
+
+- `<HF_HOME>/models--<org>--<repo>/`（新しいレイアウト）
+- `<HF_HOME>/hub/models--<org>--<repo>/`（互換レイアウト）
+
+`HF_HOME` は backend で `/root/.cache/huggingface` に固定しています（`docker-compose.yml`）。
+
 backend を再起動するとブラウザの token は残りますが、現在の簡易セッションは backend メモリ上にあるため、再ログインが必要になることがあります。
 
 ## 使い方
@@ -154,7 +182,7 @@ UI にアクセスし、`.env` の `VLLM_MANAGER_ADMIN_USER` / `VLLM_MANAGER_ADM
 LiteLLM 経由で呼び出す例です。
 
 ```bash
-curl http://localhost:14000/v1/chat/completions \
+curl http://hinton.prv.kanazawa-it.ac.jp:14000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer sk-vllm-default-key" \
   -d '{
@@ -164,7 +192,34 @@ curl http://localhost:14000/v1/chat/completions \
   }'
 ```
 
-backend 管理 vLLM を直接叩く場合は `http://localhost:18001/v1/chat/completions` を使います。
+backend 管理 vLLM を直接叩く場合は `http://hinton.prv.kanazawa-it.ac.jp:18001/v1/chat/completions` を使います。
+
+### Claude Code から LiteLLM 経由で使う（Anthropic 形式）
+
+Claude Code は `ANTHROPIC_BASE_URL` で LLM gateway を指定できます。  
+この構成では Claude Code が Anthropic Messages 形式で LiteLLM を呼び、LiteLLM が vLLM（OpenAI 互換）へ変換します。
+
+```bash
+export ANTHROPIC_BASE_URL="http://hinton.prv.kanazawa-it.ac.jp:14000"
+export ANTHROPIC_AUTH_TOKEN="sk-vllm-default-key"
+export ANTHROPIC_DEFAULT_SONNET_MODEL="claude-vllm-local"
+
+claude
+```
+
+接続確認は次でできます。
+
+```bash
+curl http://hinton.prv.kanazawa-it.ac.jp:14000/v1/messages \
+  -H "Authorization: Bearer sk-vllm-default-key" \
+  -H "Content-Type: application/json" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "claude-vllm-local",
+    "max_tokens": 64,
+    "messages": [{"role":"user","content":"hello"}]
+  }'
+```
 
 ## API エンドポイント
 

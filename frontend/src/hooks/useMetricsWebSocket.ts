@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
-import type { AppEvent, DownloadJob, MetricsData, MetricsMessage } from "@/types";
+import type { AppEvent, DownloadJob, LiteLLMProxyRequestRow, MetricsData, MetricsMessage } from "@/types";
 
 const WS_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -11,8 +11,21 @@ export function useMetricsWebSocket() {
   const [history, setHistory] = useState<MetricsData[]>([]);
   const [events, setEvents] = useState<AppEvent[]>([]);
   const [downloads, setDownloads] = useState<DownloadJob[]>([]);
+  const [litellmProxyRequests, setLitellmProxyRequests] = useState<LiteLLMProxyRequestRow[]>([]);
   const [connected, setConnected] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  const mergeLiteLLMRow = useCallback((row: LiteLLMProxyRequestRow) => {
+    setLitellmProxyRequests((prev) => {
+      const m = new Map(prev.map((r) => [r.id, r]));
+      m.set(row.id, row);
+      const now = Date.now() / 1000;
+      return Array.from(m.values()).filter((r) => {
+        if (r.status === "streaming" || r.status === "pending") return true;
+        return now - r.updated_at < 15;
+      });
+    });
+  }, []);
 
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
@@ -31,7 +44,25 @@ export function useMetricsWebSocket() {
         const msg = JSON.parse(event.data) as MetricsMessage | AppEvent;
 
         if (msg.type === "event_history" && Array.isArray((msg as AppEvent).data)) {
-          setEvents((msg as AppEvent).data as AppEvent[]);
+          const arr = (msg as AppEvent).data as AppEvent[];
+          setEvents(arr);
+          const litellmRows = arr
+            .filter((e) => e.type === "litellm_proxy_request" && e.data && typeof e.data === "object")
+            .map((e) => e.data as LiteLLMProxyRequestRow);
+          if (litellmRows.length > 0) {
+            const m = new Map<string, LiteLLMProxyRequestRow>();
+            for (const r of litellmRows) m.set(r.id, r);
+            const now = Date.now() / 1000;
+            setLitellmProxyRequests(
+              Array.from(m.values()).filter((r) => {
+                if (r.status === "streaming" || r.status === "pending") return true;
+                return now - r.updated_at < 15;
+              }),
+            );
+          }
+        } else if (msg.type === "litellm_proxy_snapshot" && msg.data && typeof msg.data === "object") {
+          const reqs = (msg.data as { requests?: LiteLLMProxyRequestRow[] }).requests;
+          if (Array.isArray(reqs)) setLitellmProxyRequests(reqs);
         } else if (msg.type === "history" && Array.isArray(msg.data)) {
           setHistory(msg.data as MetricsData[]);
           setMetrics((msg.data as MetricsData[]).at(-1) ?? null);
@@ -49,6 +80,9 @@ export function useMetricsWebSocket() {
           setEvents((prev) => [...prev.slice(-199), msg as AppEvent]);
         } else if (msg.type === "error") {
           setError(msg.message ?? "Unknown error");
+          setEvents((prev) => [...prev.slice(-199), msg as AppEvent]);
+        } else if (msg.type === "litellm_proxy_request" && msg.data && typeof msg.data === "object") {
+          mergeLiteLLMRow(msg.data as LiteLLMProxyRequestRow);
           setEvents((prev) => [...prev.slice(-199), msg as AppEvent]);
         } else if (msg.type !== "pong") {
           setEvents((prev) => [...prev.slice(-199), msg as AppEvent]);
@@ -68,7 +102,7 @@ export function useMetricsWebSocket() {
     };
 
     wsRef.current = ws;
-  }, []);
+  }, [mergeLiteLLMRow]);
 
   useEffect(() => {
     connect();
@@ -77,5 +111,5 @@ export function useMetricsWebSocket() {
     };
   }, [connect]);
 
-  return { metrics, history, events, downloads, connected, error };
+  return { metrics, history, events, downloads, litellmProxyRequests, connected, error };
 }

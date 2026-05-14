@@ -6,6 +6,8 @@ model_list:
   # - モデル名を固定せず、backend(/v1/*) 側で起動中 vLLM へ動的にルーティングする
   # - 具体的なモデルIDをここに書かなくても、起動済みモデルへ転送される
   - model_name: "vllm-local"
+    model_info:
+      mode: completion
     litellm_params:
       model: openai/vllm-local
       api_key: "sk-no-key-required"
@@ -18,6 +20,20 @@ model_list:
   # Claude Code からの利用向けエイリアス
   # - Claude Code の --model で指定しやすい名前を追加
   - model_name: "claude-vllm-local"
+    model_info:
+      mode: completion
+    litellm_params:
+      model: openai/vllm-local
+      api_key: "sk-no-key-required"
+      api_base: http://backend:8000/v1
+      rpm: 10000
+      pass_through_optional_params: true
+      extra_headers:
+        X-Vllm-Manager-Source: litellm
+  # 任意モデル名を受けるワイルドカード（実際の転送先は backend 側で解決）
+  - model_name: "*"
+    model_info:
+      mode: completion
     litellm_params:
       model: openai/vllm-local
       api_key: "sk-no-key-required"

@@ -7,11 +7,12 @@ API エンドポイント + WebSocket メトリクス配信を提供する。
 import os
 import json
 from urllib.parse import urlencode
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any, Optional
 
 from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect, APIRouter, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 import httpx
 
@@ -627,7 +628,7 @@ def _normalize_model_id(value: Any) -> str:
 
 
 def _is_alias_model(value: str) -> bool:
-    return value in {"", "vllm-local", "vllm-any", "auto"}
+    return value in {"", "vllm-local", "claude-vllm-local", "vllm-any", "auto"}
 
 
 def _pick_target_server(requested_model: str, servers: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
@@ -654,8 +655,199 @@ def _pick_target_server(requested_model: str, servers: list[dict[str, Any]]) -> 
     return sorted(candidates, key=lambda s: int(s.get("port") or 0))[0]
 
 
+def _is_stream_request_payload(payload: Optional[dict[str, Any]]) -> bool:
+    return isinstance(payload, dict) and bool(payload.get("stream"))
+
+
+def _stringify_content_block(value: Any) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if value is None:
+        return ""
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except Exception:
+        return str(value)
+
+
+def _content_blocks_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return _stringify_content_block(content)
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+            continue
+        if not isinstance(block, dict):
+            parts.append(_stringify_content_block(block))
+            continue
+        block_type = str(block.get("type") or "")
+        if block_type in {"input_text", "output_text", "text"}:
+            parts.append(_stringify_content_block(block.get("text")))
+        elif block_type == "tool_result":
+            parts.append(_stringify_content_block(block.get("content")))
+        elif block_type == "tool_use":
+            parts.append(_stringify_content_block(block.get("input")))
+        elif "text" in block:
+            parts.append(_stringify_content_block(block.get("text")))
+        elif "content" in block:
+            parts.append(_stringify_content_block(block.get("content")))
+    return "".join(parts)
+
+
+def _responses_input_to_chat_messages(input_value: Any) -> list[dict[str, Any]]:
+    if isinstance(input_value, str):
+        return [{"role": "user", "content": input_value}]
+    if not isinstance(input_value, list):
+        return [{"role": "user", "content": _stringify_content_block(input_value)}]
+
+    messages: list[dict[str, Any]] = []
+    for item in input_value:
+        if not isinstance(item, dict):
+            continue
+        item_type = str(item.get("type") or "")
+        if item_type == "message":
+            role = str(item.get("role") or "user")
+            content_text = _content_blocks_to_text(item.get("content"))
+            if role == "assistant":
+                tool_calls: list[dict[str, Any]] = []
+                for block in item.get("content", []) if isinstance(item.get("content"), list) else []:
+                    if not isinstance(block, dict):
+                        continue
+                    if str(block.get("type") or "") == "tool_use":
+                        tool_calls.append(
+                            {
+                                "id": str(block.get("id") or f"call_{len(tool_calls)+1}"),
+                                "type": "function",
+                                "function": {
+                                    "name": str(block.get("name") or "tool"),
+                                    "arguments": _stringify_content_block(block.get("input") or {}),
+                                },
+                            }
+                        )
+                msg: dict[str, Any] = {"role": "assistant", "content": content_text}
+                if tool_calls:
+                    msg["tool_calls"] = tool_calls
+                messages.append(msg)
+            else:
+                messages.append({"role": role, "content": content_text})
+        elif item_type == "function_call_output":
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": str(item.get("call_id") or ""),
+                    "content": _stringify_content_block(item.get("output")),
+                }
+            )
+    return messages
+
+
+def _responses_tools_to_chat_tools(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    tools: list[dict[str, Any]] = []
+    for tool in value:
+        if not isinstance(tool, dict):
+            continue
+        tool_type = str(tool.get("type") or "")
+        if tool_type in {"function", "custom"} and isinstance(tool.get("name"), str):
+            tools.append(
+                {
+                    "type": "function",
+                    "function": {
+                        "name": tool.get("name"),
+                        "description": _stringify_content_block(tool.get("description") or ""),
+                        "parameters": tool.get("parameters") if isinstance(tool.get("parameters"), dict) else {"type": "object"},
+                    },
+                }
+            )
+        elif tool_type == "function" and isinstance(tool.get("function"), dict):
+            tools.append({"type": "function", "function": tool.get("function")})
+    return tools
+
+
+def _responses_to_chat_completions_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    chat_payload: dict[str, Any] = {
+        "model": payload.get("model"),
+        "messages": _responses_input_to_chat_messages(payload.get("input")),
+        # responses→chat ブリッジでは非streamに固定し、返却整形を簡潔に保つ
+        "stream": False,
+    }
+    if isinstance(payload.get("tools"), list):
+        converted_tools = _responses_tools_to_chat_tools(payload.get("tools"))
+        if converted_tools:
+            chat_payload["tools"] = converted_tools
+    if payload.get("tool_choice") is not None:
+        chat_payload["tool_choice"] = payload.get("tool_choice")
+    if payload.get("temperature") is not None:
+        chat_payload["temperature"] = payload.get("temperature")
+    if payload.get("top_p") is not None:
+        chat_payload["top_p"] = payload.get("top_p")
+    max_out = payload.get("max_output_tokens")
+    if max_out is None:
+        max_out = payload.get("max_tokens")
+    if max_out is not None:
+        chat_payload["max_tokens"] = max_out
+    return chat_payload
+
+
+def _chat_completion_to_responses_payload(chat_response: dict[str, Any]) -> dict[str, Any]:
+    choice = ((chat_response.get("choices") or [{}])[0]) if isinstance(chat_response, dict) else {}
+    message = choice.get("message") if isinstance(choice, dict) else {}
+    if not isinstance(message, dict):
+        message = {}
+    text = _stringify_content_block(message.get("content"))
+    tool_calls = message.get("tool_calls") if isinstance(message.get("tool_calls"), list) else []
+
+    output_items: list[dict[str, Any]] = []
+    if text:
+        output_items.append(
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": text, "annotations": []}],
+            }
+        )
+    for idx, tc in enumerate(tool_calls):
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+        output_items.append(
+            {
+                "type": "function_call",
+                "id": str(tc.get("id") or f"fc_{idx+1}"),
+                "call_id": str(tc.get("id") or f"fc_{idx+1}"),
+                "name": str(fn.get("name") or "tool"),
+                "arguments": _stringify_content_block(fn.get("arguments") or "{}"),
+                "status": "completed",
+            }
+        )
+
+    usage = chat_response.get("usage") if isinstance(chat_response, dict) and isinstance(chat_response.get("usage"), dict) else {}
+    return {
+        "id": str(chat_response.get("id") or "resp_backend_bridge"),
+        "object": "response",
+        "created_at": int(chat_response.get("created") or 0),
+        "status": "completed",
+        "model": chat_response.get("model"),
+        "output": output_items,
+        "output_text": text,
+        "usage": {
+            "input_tokens": int(usage.get("prompt_tokens") or 0),
+            "output_tokens": int(usage.get("completion_tokens") or 0),
+            "total_tokens": int(usage.get("total_tokens") or 0),
+        },
+    }
+
+
 @app.api_route("/v1/{subpath:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
 async def proxy_openai_compat(subpath: str, request: Request):
+    original_subpath = subpath
     body = await request.body()
     method = request.method.upper()
     servers = list_running_servers()
@@ -700,19 +892,26 @@ async def proxy_openai_compat(subpath: str, request: Request):
 
     request_payload: Optional[dict[str, Any]] = None
     requested_model = ""
+    bridge_responses_to_chat = False
     if method in {"POST", "PUT", "PATCH"} and body:
         try:
             parsed = json.loads(body.decode("utf-8"))
             if isinstance(parsed, dict):
                 request_payload = parsed
                 requested_model = str(parsed.get("model") or "")
+                if subpath == "responses":
+                    request_payload = _responses_to_chat_completions_payload(parsed)
+                    requested_model = str(request_payload.get("model") or requested_model)
+                    subpath = "chat/completions"
+                    bridge_responses_to_chat = True
+                    body = json.dumps(request_payload).encode("utf-8")
         except Exception:
             request_payload = None
 
     target_server = _pick_target_server(requested_model, active_servers)
     if target_server is None and status.get("vllm_port"):
         target_port = int(status["vllm_port"])
-        target_model = None
+        target_model = status.get("model")
     elif target_server is not None:
         target_port = int(target_server["port"])
         target_model = target_server.get("model")
@@ -735,7 +934,10 @@ async def proxy_openai_compat(subpath: str, request: Request):
                 request_payload[key] = value
         body = json.dumps(request_payload).encode("utf-8")
 
-    query_string = urlencode(list(request.query_params.multi_items()))
+    query_items = list(request.query_params.multi_items())
+    if original_subpath == "messages":
+        query_items = [(k, v) for (k, v) in query_items if str(k).lower() != "beta"]
+    query_string = urlencode(query_items)
     target = f"http://127.0.0.1:{target_port}/v1/{subpath}"
     if query_string:
         target = f"{target}?{query_string}"
@@ -753,6 +955,7 @@ async def proxy_openai_compat(subpath: str, request: Request):
         and subpath in {"chat/completions", "completions"}
         and body
         and header_marks_litellm(request)
+        and not bridge_responses_to_chat
     ):
         try:
             return await proxy_litellm_tracked_v1(
@@ -765,6 +968,55 @@ async def proxy_openai_compat(subpath: str, request: Request):
             )
         except (httpx.ConnectError, httpx.ConnectTimeout):
             raise HTTPException(status_code=503, detail="vLLM upstream is unavailable") from None
+
+    if (
+        method == "POST"
+        and subpath in {"chat/completions", "completions"}
+        and _is_stream_request_payload(request_payload)
+        and not bridge_responses_to_chat
+    ):
+        client = httpx.AsyncClient(timeout=timeout, trust_env=False)
+        try:
+            req = client.build_request(
+                request.method,
+                target,
+                content=body if body else None,
+                headers=forward_headers,
+            )
+            upstream = await client.send(req, stream=True)
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            with suppress(Exception):
+                await client.aclose()
+            raise HTTPException(status_code=503, detail="vLLM upstream is unavailable")
+        except httpx.LocalProtocolError:
+            with suppress(Exception):
+                await client.aclose()
+            raise HTTPException(status_code=400, detail="invalid request headers")
+
+        response_headers = {}
+        for key, value in upstream.headers.items():
+            lk = key.lower()
+            if lk in {"content-length", "transfer-encoding", "connection", "content-encoding"}:
+                continue
+            response_headers[key] = value
+
+        async def _iter_upstream():
+            try:
+                async for chunk in upstream.aiter_raw():
+                    if chunk:
+                        yield chunk
+            finally:
+                with suppress(Exception):
+                    await upstream.aclose()
+                with suppress(Exception):
+                    await client.aclose()
+
+        return StreamingResponse(
+            _iter_upstream(),
+            status_code=upstream.status_code,
+            headers=response_headers,
+            media_type=upstream.headers.get("content-type"),
+        )
 
     try:
         async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
@@ -785,6 +1037,19 @@ async def proxy_openai_compat(subpath: str, request: Request):
         if lk in {"content-length", "transfer-encoding", "connection", "content-encoding"}:
             continue
         response_headers[key] = value
+
+    if bridge_responses_to_chat and upstream.status_code < 400:
+        try:
+            chat_payload = upstream.json()
+            responses_payload = _chat_completion_to_responses_payload(chat_payload)
+            return Response(
+                content=json.dumps(responses_payload).encode("utf-8"),
+                status_code=200,
+                headers=response_headers,
+                media_type="application/json",
+            )
+        except Exception:
+            pass
 
     return Response(
         content=upstream.content,

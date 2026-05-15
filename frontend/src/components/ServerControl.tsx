@@ -155,6 +155,60 @@ function buildSpeculativeConfig(enabled: boolean, spec: SpecForm): Record<string
   return cfg;
 }
 
+const INPUT_CLASS =
+  "w-full max-w-xs bg-bg-tertiary border border-white/10 rounded-lg px-3 py-2 text-white tabular-nums focus:outline-none focus:ring-2 focus:ring-accent-primary disabled:opacity-50";
+const SLIDER_CLASS = "w-full accent-accent-primary disabled:opacity-50";
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function parseNumberInput(raw: string, integer: boolean): number | null {
+  if (raw.trim() === "") return null;
+  const parsed = integer ? parseInt(raw, 10) : parseFloat(raw);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+const LOG_SLIDER_STEPS = 1000;
+
+function snapToStep(value: number, step: number): number {
+  if (step <= 0) return value;
+  return Math.round(value / step) * step;
+}
+
+function valueToLogSliderPos(value: number, sMin: number, sMax: number): number {
+  const v = clampNumber(value, sMin, sMax);
+  if (sMin <= 0 || sMax <= sMin) return 0;
+  const logMin = Math.log(sMin);
+  const logMax = Math.log(sMax);
+  return Math.round(((Math.log(v) - logMin) / (logMax - logMin)) * LOG_SLIDER_STEPS);
+}
+
+function logSliderPosToValue(pos: number, sMin: number, sMax: number, step: number): number {
+  const t = clampNumber(pos, 0, LOG_SLIDER_STEPS) / LOG_SLIDER_STEPS;
+  const logMin = Math.log(sMin);
+  const logMax = Math.log(sMax);
+  const raw = Math.exp(logMin + t * (logMax - logMin));
+  return clampNumber(snapToStep(raw, step), sMin, sMax);
+}
+
+type NumberPreset = {
+  label: string;
+  value: number;
+  hint?: string;
+};
+
+/** デフォルト max_tokens のプリセット（起動フォーム・選択用） */
+const DEFAULT_MAX_TOKENS_PRESETS: NumberPreset[] = [
+  { label: "短文", value: 512, hint: "タイトル生成・要約" },
+  { label: "標準", value: 2048, hint: "通常のチャット" },
+  { label: "エージェント", value: 4096, hint: "Hermes 等（推奨）" },
+  { label: "長文", value: 8192, hint: "レポート・長いコード" },
+  { label: "特大", value: 16384, hint: "キュー占有に注意" },
+];
+
+const DEFAULT_MAX_TOKENS_FALLBACK = 4096;
+
 function copyTextWithFallback(text: string): boolean {
   try {
     const textarea = document.createElement("textarea");
@@ -186,7 +240,7 @@ export default function ServerControl({
     model_id: config?.model_id ?? downloadedModels[0]?.id ?? "",
     context_length: config?.context_length ?? 8192,
     max_num_seqs: config?.max_num_seqs ?? 1,
-    default_max_tokens: config?.default_max_tokens ?? 512,
+    default_max_tokens: config?.default_max_tokens ?? DEFAULT_MAX_TOKENS_FALLBACK,
     default_temperature: config?.default_temperature ?? 0.7,
     default_top_p: config?.default_top_p ?? 0.95,
     default_frequency_penalty: config?.default_frequency_penalty ?? 0,
@@ -250,6 +304,27 @@ export default function ServerControl({
       setForm((prev) => ({ ...prev, model_id: downloadedModels[0].id }));
     }
   }, [downloadedModels, form.model_id]);
+
+  useEffect(() => {
+    if (!config) return;
+    setForm((prev) => ({
+      ...prev,
+      model_id: config.model_id ?? prev.model_id,
+      context_length: config.context_length ?? prev.context_length,
+      max_num_seqs: config.max_num_seqs ?? prev.max_num_seqs,
+      default_max_tokens: config.default_max_tokens ?? prev.default_max_tokens,
+      default_temperature: config.default_temperature ?? prev.default_temperature,
+      default_top_p: config.default_top_p ?? prev.default_top_p,
+      default_frequency_penalty: config.default_frequency_penalty ?? prev.default_frequency_penalty,
+      default_presence_penalty: config.default_presence_penalty ?? prev.default_presence_penalty,
+      gpu_memory_mode: config.gpu_memory_mode ?? prev.gpu_memory_mode,
+      gpu_memory_utilization: config.gpu_memory_utilization ?? prev.gpu_memory_utilization,
+      tensor_parallel_size: config.tensor_parallel_size ?? prev.tensor_parallel_size,
+      gpu_devices: config.gpu_devices ?? prev.gpu_devices,
+      enable_auto_tool_choice: config.enable_auto_tool_choice ?? prev.enable_auto_tool_choice,
+      tool_call_parser: config.tool_call_parser ?? prev.tool_call_parser,
+    }));
+  }, [config]);
 
   async function handleStart() {
     setAction("starting");
@@ -388,10 +463,23 @@ export default function ServerControl({
             label="コンテキスト長"
             hint="vLLM の `--max-model-len` に対応します。入力＋生成で扱えるトークン上限の目安です。大きくすると KV キャッシュ用 VRAM が増え、同じ GPU でも取れる `max_tokens` や同時リクエスト数が減りやすくなります。256K は非常に重いので、まず 32K〜64K から試すのが安全です。"
           />
+          <div className="mb-2">
+            <NumberSliderField
+              label="トークン数"
+              hint="プリセット以外の値も直接入力できます（4096〜262144）。"
+              value={form.context_length}
+              onChange={(context_length) => setForm({ ...form, context_length })}
+              min={4096}
+              max={262144}
+              step={1024}
+              disabled={isBusy}
+            />
+          </div>
           <div className="flex gap-2 flex-wrap">
             {contextPresets.map((p) => (
               <button
                 key={p.value}
+                type="button"
                 onClick={() => setForm({ ...form, context_length: p.value })}
                 disabled={isBusy}
                 className={`px-4 py-2 rounded-lg text-sm font-medium transition-all ${
@@ -407,41 +495,38 @@ export default function ServerControl({
         </div>
 
         {/* スロット数 */}
-        <div className="mb-4">
-          <FieldLabel
-            label={`最大同時リクエスト数: ${form.max_num_seqs}`}
-            hint="vLLM の `--max-num-seqs` です。「同時に何件のチャットリクエストをスロットに載せられるか」の上限です。大きくするとスループットは伸びますが、長コンテキストでは KV 領域が足りず OOM しやすくなります。この UI では 1〜20 に制限しています。"
-          />
-          <input
-            type="range"
-            min="1"
-            max="20"
-            step="1"
-            value={form.max_num_seqs}
-            onChange={(e) => setForm({ ...form, max_num_seqs: parseInt(e.target.value) })}
-            disabled={isBusy}
-            className="w-full accent-accent-primary"
-          />
-        </div>
+        <NumberSliderField
+          className="mb-4"
+          label="最大同時リクエスト数（max_num_seqs）"
+          hint="vLLM の max-num-seqs。Hermes など並列リクエストが多い場合は 6〜8 程度を検討（1〜20）。"
+          value={form.max_num_seqs}
+          onChange={(max_num_seqs) => setForm({ ...form, max_num_seqs })}
+          min={1}
+          max={20}
+          step={1}
+          disabled={isBusy}
+        />
 
         {/* デフォルト max_tokens */}
         <div className="mb-4">
-          <FieldLabel
-            label={`デフォルト max_tokens: ${form.default_max_tokens}`}
-            hint="バックエンドの OpenAI 互換プロキシが、`/v1/chat/completions` 等で `max_tokens` が無い・null のときにこの値を JSON に差し込みます（クライアントが明示した値は上書きしません）。エージェント用途では長めにしておくと切れにくいですが、VRAM とレイテンシは増えます。"
-          />
-          <input
-            type="range"
-            min="16"
-            max="262144"
-            step="256"
+          <NumberSliderField
+            label="デフォルト max_tokens"
+            hint="クライアントが max_tokens を省略したときにプロキシが注入する上限です。プリセットを選ぶか、数値入力・スライダーで調整できます。"
             value={form.default_max_tokens}
-            onChange={(e) => setForm({ ...form, default_max_tokens: parseInt(e.target.value) })}
+            onChange={(default_max_tokens) => setForm({ ...form, default_max_tokens })}
+            min={1}
+            max={262144}
+            step={1}
+            sliderMin={256}
+            sliderMax={131072}
+            sliderStep={256}
+            sliderScale="log"
+            sliderHint="対数スケール"
+            presets={DEFAULT_MAX_TOKENS_PRESETS}
             disabled={isBusy}
-            className="w-full accent-accent-primary"
           />
           <p className="mt-1 text-xs text-gray-500">
-            目安: 短文なら 128〜512、長文回答なら 2048 以上。Hermes Agent のような長め用途は 8192 以上を推奨。
+            初回の既定値は {DEFAULT_MAX_TOKENS_FALLBACK.toLocaleString()}（エージェント向け）。131,072 超は数値入力のみ。
           </p>
         </div>
 
@@ -547,17 +632,18 @@ export default function ServerControl({
           </div>
           {form.gpu_memory_mode === "manual" ? (
             <>
-              <input
-                type="range"
-                min="0.1"
-                max="0.85"
-                step="0.05"
+              <NumberSliderField
+                label="GPU メモリ利用率（0.1〜0.85）"
+                hint="vLLM の `--gpu-memory-utilization` に対応。例: 0.75 と入力。"
                 value={form.gpu_memory_utilization}
-                onChange={(e) =>
-                  setForm({ ...form, gpu_memory_utilization: parseFloat(e.target.value) })
+                onChange={(gpu_memory_utilization) =>
+                  setForm({ ...form, gpu_memory_utilization })
                 }
+                min={0.1}
+                max={0.85}
+                step={0.05}
+                integer={false}
                 disabled={isBusy}
-                className="w-full accent-accent-primary"
               />
               <p className="mt-1 text-xs text-gray-500">
                 手動目安: 0.60〜0.75。起動失敗/OOM が出る場合はさらに下げてください。
@@ -571,22 +657,17 @@ export default function ServerControl({
         </div>
 
         {/* テンソル並列数 */}
-        <div className="mb-4">
-          <FieldLabel
-            label={`テンソル並列数: ${form.tensor_parallel_size}`}
-            hint="vLLM の `--tensor-parallel-size`（TP）。重みを複数 GPU に分割します。1 で単一 GPU、大きいモデルを複数枚で載せるときに 2,4,8 など。利用する GPU 枚数以上にはできません。「使用GPU」で選んだ枚数・順番と整合させてください。"
-          />
-          <input
-            type="range"
-            min="1"
-            max="8"
-            step="1"
-            value={form.tensor_parallel_size}
-            onChange={(e) => setForm({ ...form, tensor_parallel_size: parseInt(e.target.value) })}
-            disabled={isBusy}
-            className="w-full accent-accent-primary"
-          />
-        </div>
+        <NumberSliderField
+          className="mb-4"
+          label="テンソル並列数（tensor_parallel_size）"
+          hint="vLLM の tensor-parallel-size。1 で単一 GPU、複数 GPU 時は 2,4,8 など（1〜8）。"
+          value={form.tensor_parallel_size}
+          onChange={(tensor_parallel_size) => setForm({ ...form, tensor_parallel_size })}
+          min={1}
+          max={8}
+          step={1}
+          disabled={isBusy}
+        />
 
         {/* 使用GPU */}
         <div className="mb-4">
@@ -1202,6 +1283,168 @@ export default function ServerControl({
     </div>
   );
 }
+
+function NumberSliderField({
+  className = "",
+  label,
+  hint,
+  value,
+  onChange,
+  min,
+  max,
+  step = 1,
+  integer = true,
+  disabled,
+  showSlider = true,
+  sliderMin,
+  sliderMax,
+  sliderStep,
+  sliderScale = "linear",
+  sliderHint,
+  presets,
+  quickValues,
+}: {
+  className?: string;
+  label: string;
+  hint: string;
+  value: number;
+  onChange: (value: number) => void;
+  min: number;
+  max: number;
+  step?: number;
+  integer?: boolean;
+  disabled?: boolean;
+  showSlider?: boolean;
+  sliderMin?: number;
+  sliderMax?: number;
+  sliderStep?: number;
+  sliderScale?: "linear" | "log";
+  sliderHint?: string;
+  presets?: NumberPreset[];
+  quickValues?: number[];
+}) {
+  const sMin = sliderMin ?? min;
+  const sMax = sliderMax ?? max;
+  const sStep = sliderStep ?? step;
+  const isLog = sliderScale === "log" && sMin > 0 && sMax > sMin;
+
+  const linearSliderValue = clampNumber(value, sMin, sMax);
+  const logSliderPos = isLog ? valueToLogSliderPos(value, sMin, sMax) : 0;
+
+  const apply = (next: number) => onChange(clampNumber(next, min, max));
+
+  return (
+    <div className={className}>
+      <FieldLabel label={label} hint={hint} />
+      <div className="max-w-2xl space-y-2">
+        {presets && presets.length > 0 && (
+          <div>
+            <p className="mb-1.5 text-xs text-gray-500">プリセット</p>
+            <div className="flex flex-wrap gap-2">
+              {presets.map((preset) => {
+                const selected = value === preset.value;
+                return (
+                  <button
+                    key={`${preset.label}-${preset.value}`}
+                    type="button"
+                    disabled={disabled}
+                    title={preset.hint}
+                    onClick={() => apply(preset.value)}
+                    className={`flex min-w-[5.5rem] flex-col items-start rounded-lg border px-3 py-2 text-left transition-colors ${
+                      selected
+                        ? "border-accent-primary bg-accent-primary/15 text-white"
+                        : "border-white/10 bg-bg-tertiary text-gray-300 hover:border-white/20 hover:text-white"
+                    } disabled:opacity-50`}
+                  >
+                    <span className="text-xs font-semibold">{preset.label}</span>
+                    <span className={`text-sm tabular-nums ${selected ? "text-accent-primary" : "text-gray-400"}`}>
+                      {preset.value.toLocaleString()}
+                    </span>
+                    {preset.hint && (
+                      <span className="mt-0.5 text-[10px] leading-tight text-gray-500">{preset.hint}</span>
+                    )}
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+        <input
+          type="number"
+          min={min}
+          max={max}
+          step={step}
+          value={value}
+          disabled={disabled}
+          onChange={(e) => {
+            const parsed = parseNumberInput(e.target.value, integer);
+            if (parsed !== null) apply(parsed);
+          }}
+          onBlur={(e) => {
+            const parsed = parseNumberInput(e.target.value, integer);
+            if (parsed === null) apply(value);
+          }}
+          className={INPUT_CLASS}
+        />
+        {showSlider && (
+          <>
+            <input
+              type="range"
+              min={isLog ? 0 : sMin}
+              max={isLog ? LOG_SLIDER_STEPS : sMax}
+              step={isLog ? 1 : sStep}
+              value={isLog ? logSliderPos : linearSliderValue}
+              disabled={disabled}
+              onChange={(e) => {
+                const parsed = integer
+                  ? parseInt(e.target.value, 10)
+                  : parseFloat(e.target.value);
+                if (!Number.isFinite(parsed)) return;
+                if (isLog) {
+                  apply(logSliderPosToValue(parsed, sMin, sMax, sStep));
+                } else {
+                  apply(parsed);
+                }
+              }}
+              className={SLIDER_CLASS}
+            />
+            <div className="flex justify-between text-xs text-gray-500 tabular-nums">
+              <span>{sMin.toLocaleString()}</span>
+              <span>{sliderHint ?? (isLog ? "対数スケール" : "")}</span>
+              <span>{sMax.toLocaleString()}</span>
+            </div>
+          </>
+        )}
+        {quickValues && quickValues.length > 0 && !presets?.length && (
+          <div className="flex flex-wrap gap-2">
+            {quickValues.map((qv) => (
+              <button
+                key={qv}
+                type="button"
+                disabled={disabled}
+                onClick={() => apply(qv)}
+                className={`px-2.5 py-1 rounded-md text-xs font-medium border transition-colors ${
+                  value === qv
+                    ? "bg-accent-primary text-white border-accent-primary"
+                    : "bg-bg-tertiary text-gray-400 border-white/10 hover:text-white"
+                } disabled:opacity-50`}
+              >
+                {qv.toLocaleString()}
+              </button>
+            ))}
+          </div>
+        )}
+        {showSlider && value > sMax && (
+          <p className="text-xs text-gray-500">
+            スライダーは {sMax.toLocaleString()} まで。現在 {value.toLocaleString()}（数値入力で指定中）
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
 
 function FieldLabel({ label, hint }: { label: string; hint: string }) {
   return (

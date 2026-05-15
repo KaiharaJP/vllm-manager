@@ -6,7 +6,7 @@ API エンドポイント + WebSocket メトリクス配信を提供する。
 
 import os
 import json
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from contextlib import asynccontextmanager, suppress
 from typing import Any, Optional
 
@@ -129,7 +129,7 @@ class SelfUserUpdateRequest(BaseModel):
 
 
 class SelfApiKeyRequest(BaseModel):
-    models: list[str] = Field(default_factory=lambda: ["vllm-local"])
+    models: list[str] = Field(..., min_length=1)
     max_budget: Optional[float] = None
     budget_duration: Optional[str] = None
     rpm_limit: Optional[int] = None
@@ -137,7 +137,7 @@ class SelfApiKeyRequest(BaseModel):
 
 
 class AdminUserApiKeyRequest(BaseModel):
-    models: list[str] = Field(default_factory=lambda: ["vllm-local"])
+    models: list[str] = Field(..., min_length=1)
     max_budget: Optional[float] = None
     budget_duration: Optional[str] = None
     rpm_limit: Optional[int] = None
@@ -146,8 +146,6 @@ class AdminUserApiKeyRequest(BaseModel):
 
 async def _litellm_list_keys_detailed() -> list[dict[str, Any]]:
     """Return detailed key info entries via /key/list + /key/info."""
-    from urllib.parse import quote
-
     data = await litellm_request("GET", "/key/list")
     raw_keys = data.get("keys", []) if isinstance(data, dict) else data
     if not isinstance(raw_keys, list):
@@ -161,6 +159,22 @@ async def _litellm_list_keys_detailed() -> list[dict[str, Any]]:
         if isinstance(info, dict):
             detailed.append(info)
     return detailed
+
+
+def _sanitize_models(models: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for model in models:
+        if not isinstance(model, str):
+            continue
+        value = model.strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        cleaned.append(value)
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="models must contain at least one non-empty model id")
+    return cleaned
 
 
 class ModelRegisterRequest(BaseModel):
@@ -275,10 +289,11 @@ async def api_my_litellm_keys(user: dict = Depends(get_current_user)):
 
 @router.post("/api/auth/me/api-keys")
 async def api_my_litellm_create_key(req: SelfApiKeyRequest, user: dict = Depends(get_current_user)):
+    models = _sanitize_models(req.models)
     payload: dict[str, Any] = {
         "user_id": user.get("litellm_user_id") or user["username"],
         "team_id": user.get("litellm_team_id") or None,
-        "models": req.models or ["vllm-local"],
+        "models": models,
     }
     if req.max_budget is not None:
         payload["max_budget"] = req.max_budget
@@ -319,10 +334,11 @@ async def api_user_litellm_create_key(username: str, req: AdminUserApiKeyRequest
     if username not in users:
         raise HTTPException(status_code=404, detail="User not found")
     u = public_user(users[username])
+    models = _sanitize_models(req.models)
     payload: dict[str, Any] = {
         "user_id": u.get("litellm_user_id") or u["username"],
         "team_id": u.get("litellm_team_id") or None,
-        "models": req.models or ["vllm-local"],
+        "models": models,
     }
     if req.max_budget is not None:
         payload["max_budget"] = req.max_budget
@@ -631,6 +647,82 @@ def _is_alias_model(value: str) -> bool:
     return value in {"", "vllm-local", "claude-vllm-local", "vllm-any", "auto"}
 
 
+def _extract_bearer_token(request: Request) -> str:
+    header = request.headers.get("authorization") or ""
+    if not header.lower().startswith("bearer "):
+        return ""
+    return header[7:].strip()
+
+
+def _model_allowed_for_key(model_id: str, allowed_models: set[str]) -> bool:
+    normalized = _normalize_model_id(model_id)
+    if not normalized:
+        return False
+    if normalized in allowed_models:
+        return True
+
+    normalized_leaf = normalized.split("/")[-1]
+    if normalized_leaf in allowed_models:
+        return True
+
+    for allowed in allowed_models:
+        allowed_leaf = allowed.split("/")[-1]
+        if allowed_leaf == normalized_leaf:
+            return True
+    return False
+
+
+async def _allowed_models_from_litellm_key(api_key: str) -> Optional[list[str]]:
+    if not api_key:
+        return None
+    try:
+        payload = await litellm_request("GET", f"/key/info?key={quote(api_key)}")
+    except Exception:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+
+    info = payload.get("info")
+    holder = info if isinstance(info, dict) else payload
+    models = holder.get("models") if isinstance(holder, dict) else None
+    if not isinstance(models, list):
+        return []
+    return [m.strip() for m in models if isinstance(m, str) and m.strip()]
+
+
+async def _collect_active_vllm_models(
+    *,
+    active_servers: list[dict[str, Any]],
+    status: dict[str, Any],
+) -> list[dict[str, Any]]:
+    timeout = httpx.Timeout(30.0, connect=5.0)
+    all_models: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    # /v1/models は自己再帰ポートを除外した上で、検出された vLLM を集約する。
+    ports = sorted({int(s["port"]) for s in active_servers if s.get("port") is not None})
+    if not ports and status.get("vllm_port"):
+        status_port = int(status["vllm_port"])
+        ports = [status_port] if not _is_backend_self_port(status_port) else []
+
+    async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+        for port in ports:
+            try:
+                upstream = await client.get(f"http://127.0.0.1:{port}/v1/models")
+                upstream.raise_for_status()
+                payload = upstream.json()
+                for entry in payload.get("data", []) if isinstance(payload, dict) else []:
+                    model_id = str(entry.get("id", ""))
+                    if not model_id or model_id in seen:
+                        continue
+                    seen.add(model_id)
+                    all_models.append(entry)
+            except Exception:
+                continue
+    return all_models
+
+
 def _pick_target_server(requested_model: str, servers: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
     normalized = _normalize_model_id(requested_model)
     candidates = [s for s in servers if s.get("port")]
@@ -859,31 +951,21 @@ async def proxy_openai_compat(subpath: str, request: Request):
         raise HTTPException(status_code=503, detail="vLLM server is not running")
 
     if method == "GET" and subpath == "models":
-        timeout = httpx.Timeout(30.0, connect=5.0)
-        all_models: list[dict[str, Any]] = []
-        seen: set[str] = set()
-        # /v1/models は自己再帰ポートを除外した上で、検出された vLLM を集約する。
-        ports = sorted({int(s["port"]) for s in active_servers if s.get("port") is not None})
-        if not ports and status.get("vllm_port"):
-            status_port = int(status["vllm_port"])
-            ports = [status_port] if not _is_backend_self_port(status_port) else []
         try:
-            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
-                for port in ports:
-                    try:
-                        upstream = await client.get(f"http://127.0.0.1:{port}/v1/models")
-                        upstream.raise_for_status()
-                        payload = upstream.json()
-                        for entry in payload.get("data", []) if isinstance(payload, dict) else []:
-                            model_id = str(entry.get("id", ""))
-                            if not model_id or model_id in seen:
-                                continue
-                            seen.add(model_id)
-                            all_models.append(entry)
-                    except Exception:
-                        continue
+            all_models = await _collect_active_vllm_models(active_servers=active_servers, status=status)
         except (httpx.ConnectError, httpx.ConnectTimeout):
             raise HTTPException(status_code=503, detail="vLLM upstream is unavailable")
+
+        if header_marks_litellm(request):
+            incoming_key = _extract_bearer_token(request)
+            allowed = await _allowed_models_from_litellm_key(incoming_key)
+            if allowed is None:
+                raise HTTPException(status_code=401, detail="Unable to verify LiteLLM key models")
+            normalized_allowed = {_normalize_model_id(m) for m in allowed if _normalize_model_id(m)}
+            if "*" not in normalized_allowed:
+                all_models = [
+                    m for m in all_models if _model_allowed_for_key(str(m.get("id", "")), normalized_allowed)
+                ]
         return Response(
             content=json.dumps({"object": "list", "data": all_models}).encode("utf-8"),
             media_type="application/json",

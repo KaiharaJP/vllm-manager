@@ -9,6 +9,25 @@ interface UserManagementPanelProps {
   currentUser: AppUser;
 }
 
+function copyTextWithFallback(text: string): boolean {
+  try {
+    const textarea = document.createElement("textarea");
+    textarea.value = text;
+    textarea.setAttribute("readonly", "");
+    textarea.style.position = "fixed";
+    textarea.style.opacity = "0";
+    textarea.style.pointerEvents = "none";
+    document.body.appendChild(textarea);
+    textarea.focus();
+    textarea.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(textarea);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 export default function UserManagementPanel({ currentUser }: UserManagementPanelProps) {
   const [users, setUsers] = useState<AppUser[]>([]);
   const [message, setMessage] = useState<string | null>(null);
@@ -36,6 +55,7 @@ export default function UserManagementPanel({ currentUser }: UserManagementPanel
     tpm_limit: "",
   });
   const [copiedKeySig, setCopiedKeySig] = useState<string | null>(null);
+  const [issuedSecretsByToken, setIssuedSecretsByToken] = useState<Record<string, string>>({});
 
   type KeyInfo = {
     key_name?: string | null;
@@ -49,7 +69,23 @@ export default function UserManagementPanel({ currentUser }: UserManagementPanel
     created_at?: string | null;
     expires?: string | null;
   };
-  type KeyEntry = { key?: string; info?: KeyInfo };
+  type KeyEntry = { key?: string; deleteKey?: string; info?: KeyInfo };
+
+  function rememberIssuedSecret(created: unknown) {
+    if (!created || typeof created !== "object") return;
+    const obj = created as Record<string, unknown>;
+    const key = typeof obj.key === "string" ? obj.key.trim() : "";
+    const token = typeof obj.token === "string" ? obj.token.trim() : "";
+    if (!key.startsWith("sk-") || !token) return;
+    setIssuedSecretsByToken((prev) => ({ ...prev, [token]: key }));
+  }
+
+  function parseModels(raw: string): string[] {
+    return raw
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
 
   useEffect(() => {
     if (currentUser.role === "admin") {
@@ -166,10 +202,13 @@ export default function UserManagementPanel({ currentUser }: UserManagementPanel
     if (!liteKeys) return [];
     return Array.isArray(liteKeys) ? liteKeys : [];
   }, [liteKeys, selectedUser]);
+  const normalizedModelSelection = useMemo(() => parseModels(keyOptions.models), [keyOptions.models]);
+  const hasModelSelection = normalizedModelSelection.length > 0;
 
   /** LiteLLM の /key/info 応答はバージョンでトップレベル key の有無が違うため複数パスから拾う */
   function pickSecretString(item: Record<string, unknown>): string {
     const tryStr = (v: unknown) => (typeof v === "string" && v.trim() ? v.trim() : "");
+    const looksLikeVirtualKey = (v: string) => v.startsWith("sk-");
     const candidates: unknown[] = [
       item.key,
       item.token,
@@ -183,7 +222,8 @@ export default function UserManagementPanel({ currentUser }: UserManagementPanel
     }
     for (const c of candidates) {
       const s = tryStr(c);
-      if (s) return s;
+      // 実際に API 認証に使える virtual key のみ採用する
+      if (s && looksLikeVirtualKey(s)) return s;
     }
     return "";
   }
@@ -193,23 +233,49 @@ export default function UserManagementPanel({ currentUser }: UserManagementPanel
       .filter((item): item is Record<string, unknown> => !!item && typeof item === "object")
       .map((item) => {
         const infoRaw = item.info;
-        const secret = pickSecretString(item);
+        const directSecret = pickSecretString(item);
+        const rawDeleteKey =
+          typeof item.key === "string" && item.key.trim().length > 0
+            ? item.key.trim()
+            : undefined;
+        const rememberedSecret =
+          rawDeleteKey && issuedSecretsByToken[rawDeleteKey]
+            ? issuedSecretsByToken[rawDeleteKey]
+            : undefined;
+        const secret = directSecret || rememberedSecret || "";
         return {
           key: secret || undefined,
+          // key/list ではハッシュのみ返るため、削除時はこの識別子を使う
+          deleteKey: rawDeleteKey,
           info: infoRaw && typeof infoRaw === "object" ? (infoRaw as KeyInfo) : undefined,
         };
       });
   }
 
-  async function copyApiKeyMaterial(text: string, sig: string) {
+  async function copyApiKeyMaterial(text: string, sig: string, isRealApiKey: boolean) {
     const t = text.trim();
     if (!t) return;
     try {
-      await navigator.clipboard.writeText(t);
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(t);
+      } else if (!copyTextWithFallback(t)) {
+        throw new Error("fallback failed");
+      }
       setCopiedKeySig(sig);
+      if (!isRealApiKey) {
+        setApiMessage("表示値（key_name）をコピーしました。これは識別子であり、Bearer 認証には使えません。");
+      }
       window.setTimeout(() => setCopiedKeySig(null), 2000);
     } catch {
-      setApiMessage("クリップボードへのコピーに失敗しました。");
+      if (copyTextWithFallback(t)) {
+        setCopiedKeySig(sig);
+        if (!isRealApiKey) {
+          setApiMessage("表示値（key_name）をコピーしました。これは識別子であり、Bearer 認証には使えません。");
+        }
+        window.setTimeout(() => setCopiedKeySig(null), 2000);
+        return;
+      }
+      setApiMessage("クリップボードへのコピーに失敗しました（HTTP配信やブラウザ権限でブロックされる場合があります）。");
     }
   }
 
@@ -224,13 +290,12 @@ export default function UserManagementPanel({ currentUser }: UserManagementPanel
   }) {
     const secret =
       typeof entry.key === "string" && entry.key.length > 0 ? entry.key : "";
-    const fallback = entry.info?.key_name?.trim() || "";
+    const fallback = entry.info?.key_name?.trim() || ""; // key_name は表示用（認証には使えない）
     const copyTarget = secret || fallback;
+    const hasRealApiKey = Boolean(secret);
     const sig = `${scope}-${index}-${copyTarget.slice(0, 24)}`;
     const display =
-      secret && secret.startsWith("sk-")
-        ? `${secret.slice(0, 12)}…${secret.slice(-6)}`
-        : secret || fallback || "—";
+      secret || fallback || "—";
     const copied = copiedKeySig === sig;
     return (
       <div className="w-full rounded-lg border border-accent-primary/35 bg-bg-tertiary/70 p-3 space-y-2">
@@ -243,11 +308,11 @@ export default function UserManagementPanel({ currentUser }: UserManagementPanel
             type="button"
             disabled={!copyTarget}
             title={copyTarget ? "クリップボードにコピー" : "コピーできる値がありません"}
-            onClick={() => copyApiKeyMaterial(copyTarget, sig)}
+            onClick={() => copyApiKeyMaterial(copyTarget, sig, hasRealApiKey)}
             className="inline-flex w-full shrink-0 items-center justify-center gap-2 rounded-lg bg-accent-primary px-4 py-2.5 text-sm font-medium text-white shadow-sm hover:bg-accent-primary/90 disabled:cursor-not-allowed disabled:opacity-40 sm:w-auto sm:self-start"
           >
             <ClipboardCopy className="h-4 w-4 shrink-0" />
-            {copied ? "コピーしました" : "クリップボードにコピー"}
+            {copied ? "コピーしました" : hasRealApiKey ? "APIキーをコピー" : "表示値をコピー"}
           </button>
         </div>
         {!secret && (
@@ -268,6 +333,12 @@ export default function UserManagementPanel({ currentUser }: UserManagementPanel
     setApiMessage("削除中...");
     try {
       await api.deleteLiteLLMKey({ keys: [keyId] });
+      setIssuedSecretsByToken((prev) => {
+        if (!(keyId in prev)) return prev;
+        const next = { ...prev };
+        delete next[keyId];
+        return next;
+      });
       setApiMessage("APIキーを削除しました。");
       await refreshLiteKeys();
     } catch (err) {
@@ -279,14 +350,28 @@ export default function UserManagementPanel({ currentUser }: UserManagementPanel
     setApiMessage("発行中...");
     try {
       if (currentUser.role !== "admin") {
-        const models = keyOptions.models.split(",").map((s) => s.trim()).filter(Boolean);
+        const models = parseModels(keyOptions.models);
+        if (!models.length) {
+          setApiMessage("モデル名を1つ以上指定してください。`*` を指定すると全モデルアクセスになります。");
+          return;
+        }
         const payload: any = { models: models.length ? models : ["vllm-local"] };
         if (keyOptions.max_budget) payload.max_budget = Number(keyOptions.max_budget);
         if (keyOptions.budget_duration) payload.budget_duration = keyOptions.budget_duration;
         if (keyOptions.rpm_limit) payload.rpm_limit = Number(keyOptions.rpm_limit);
         if (keyOptions.tpm_limit) payload.tpm_limit = Number(keyOptions.tpm_limit);
-        await api.createMyApiKey(payload);
-        setApiMessage("あなた向けの LiteLLM API キーを発行しました");
+        const created = await api.createMyApiKey(payload);
+        rememberIssuedSecret(created);
+        if (created && typeof created === "object" && "key" in (created as any)) {
+          const k = (created as any).key;
+          if (typeof k === "string") {
+            setApiMessage(`あなた向けの LiteLLM API キーを発行しました。\n\n${k}`);
+          } else {
+            setApiMessage("あなた向けの LiteLLM API キーを発行しました");
+          }
+        } else {
+          setApiMessage("あなた向けの LiteLLM API キーを発行しました");
+        }
         await refreshMyKeys();
         return;
       }
@@ -294,13 +379,18 @@ export default function UserManagementPanel({ currentUser }: UserManagementPanel
         setApiMessage("ユーザーが選択されていません。");
         return;
       }
-      const models = keyOptions.models.split(",").map((s) => s.trim()).filter(Boolean);
+      const models = parseModels(keyOptions.models);
+      if (!models.length) {
+        setApiMessage("モデル名を1つ以上指定してください。`*` を指定すると全モデルアクセスになります。");
+        return;
+      }
       const payload: any = { models: models.length ? models : ["vllm-local"] };
       if (keyOptions.max_budget) payload.max_budget = Number(keyOptions.max_budget);
       if (keyOptions.budget_duration) payload.budget_duration = keyOptions.budget_duration;
       if (keyOptions.rpm_limit) payload.rpm_limit = Number(keyOptions.rpm_limit);
       if (keyOptions.tpm_limit) payload.tpm_limit = Number(keyOptions.tpm_limit);
       const created = await api.createUserApiKey(selectedUser.username, payload);
+      rememberIssuedSecret(created);
       setApiMessage("このユーザー向けの LiteLLM API キーを発行しました");
       await refreshLiteKeys();
       // 返ってきた key があれば表示（コピーしやすい）
@@ -653,7 +743,8 @@ export default function UserManagementPanel({ currentUser }: UserManagementPanel
                     </button>
                     <button
                       onClick={issueApiKeyForSelectedUser}
-                      className="inline-flex items-center gap-1 rounded-md bg-accent-primary px-2 py-1 text-[11px] text-white"
+                      disabled={!hasModelSelection}
+                      className="inline-flex items-center gap-1 rounded-md bg-accent-primary px-2 py-1 text-[11px] text-white disabled:cursor-not-allowed disabled:opacity-50"
                     >
                       <Key className="w-3 h-3" />
                       このユーザー向けにAPIキー発行
@@ -671,10 +762,13 @@ export default function UserManagementPanel({ currentUser }: UserManagementPanel
                     <span className="mb-1 block text-sm font-medium text-gray-300">利用できるモデル</span>
                     <input
                       className="w-full bg-bg-tertiary border border-white/10 rounded-lg px-3 py-2 text-xs"
-                      placeholder="通常は vllm-local（複数はカンマ区切り）"
+                      placeholder="例: cyankiwi/Qwen3.6-27B-AWQ-BF16-INT4（複数はカンマ区切り）"
                       value={keyOptions.models}
                       onChange={(e) => setKeyOptions({ ...keyOptions, models: e.target.value })}
                     />
+                    <p className="mt-1 text-[11px] text-gray-500">
+                      `*` を指定すると全モデルアクセスキーになります。`*` 以外ではモデル名を1つ以上指定してください。
+                    </p>
                   </label>
                   <label className="block">
                     <span className="mb-1 block text-sm font-medium text-gray-300">予算上限 (USD)</span>
@@ -737,7 +831,7 @@ export default function UserManagementPanel({ currentUser }: UserManagementPanel
                             <p><span className="text-gray-500">有効期限:</span> {entry.info?.expires || "なし"}</p>
                           </div>
                           <button
-                            onClick={() => deleteApiKey(entry.key)}
+                            onClick={() => deleteApiKey(entry.deleteKey || entry.key)}
                             className="shrink-0 rounded-md border border-red-500/40 bg-red-500/10 px-2 py-1 text-[11px] text-red-300 hover:bg-red-500/20"
                           >
                             削除

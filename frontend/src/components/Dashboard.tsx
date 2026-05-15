@@ -66,13 +66,22 @@ export default function Dashboard({ currentUser, onLogout }: DashboardProps) {
   async function loadInitialData() {
     try {
       setLoadError(null);
-      const [statusData, configData, modelsData, presetsData, jobsData] = await Promise.all([
+      const loadAll = Promise.all([
         api.getStatus(),
         api.getConfig(),
         api.getModels(),
         api.getContextPresets(),
         currentUser.role === "admin" ? api.getModelDownloads() : Promise.resolve([]),
       ]);
+      const loadWithDeadline = Promise.race([
+        loadAll,
+        new Promise<never>((_, reject) => {
+          window.setTimeout(() => {
+            reject(new Error("初期データ取得がタイムアウトしました（12秒）"));
+          }, 12_000);
+        }),
+      ]);
+      const [statusData, configData, modelsData, presetsData, jobsData] = await loadWithDeadline;
       setStatus(statusData);
       setConfig(configData);
       setModels(modelsData);

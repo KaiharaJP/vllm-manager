@@ -1,6 +1,6 @@
 // API クライアント
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const API_BASE = (process.env.NEXT_PUBLIC_API_URL || "").replace(/\/$/, "");
 
 /**
  * fetch の中止だけでは TCP が固まった環境で効かないことがあるため、
@@ -43,6 +43,8 @@ function getToken(): string | null {
 }
 
 async function request<T>(path: string, options?: RequestInit): Promise<T> {
+  const url = API_BASE ? `${API_BASE}${path}` : path;
+  const backendLabel = API_BASE || "同一オリジン (/api 経由)";
   const token = getToken();
   const deadlineCtrl = new AbortController();
   const deadlineTimer = setTimeout(() => deadlineCtrl.abort(), REQUEST_DEADLINE_MS);
@@ -51,7 +53,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
   try {
     let resp: Response;
     try {
-      resp = await fetch(`${API_BASE}${path}`, {
+      resp = await fetch(url, {
         ...options,
         signal,
         headers: {
@@ -65,7 +67,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
         e instanceof Error &&
         (e.name === "AbortError" || e.name === "TimeoutError");
       const msg = isAbort
-        ? `API の応答がタイムアウトしました（${REQUEST_DEADLINE_MS / 1000}秒以内に完了しませんでした）。バックエンド (${API_BASE}) が起動しているか、ブラウザから到達できるか確認してください。`
+        ? `API の応答がタイムアウトしました（${REQUEST_DEADLINE_MS / 1000}秒以内に完了しませんでした）。バックエンド (${backendLabel}) が起動しているか、ブラウザから到達できるか確認してください。`
         : `API に接続できませんでした: ${e instanceof Error ? e.message : String(e)}`;
       throw new ApiRequestError(msg, undefined, { cause: e });
     }

@@ -21,11 +21,23 @@ export default function AuthGate({ children }: AuthGateProps) {
       try {
         setError(null);
         if (window.localStorage.getItem("vllm_manager_token")) {
-          setUser(await api.me());
+          const restored = await Promise.race([
+            api.me(),
+            new Promise<never>((_, reject) => {
+              window.setTimeout(() => {
+                reject(
+                  new ApiRequestError(
+                    "セッション復元がタイムアウトしました。再ログインしてください。"
+                  )
+                );
+              }, 12_000);
+            }),
+          ]);
+          setUser(restored);
         }
       } catch (e) {
         const status = e instanceof ApiRequestError ? e.status : undefined;
-        if (status === 401 || status === 403) {
+        if (status === 401 || status === 403 || e instanceof ApiRequestError) {
           window.localStorage.removeItem("vllm_manager_token");
         }
         const msg =

@@ -119,8 +119,8 @@ services:
   litellm:
     image: ghcr.io/berriai/litellm:main-stable
     container_name: vllm-manager-litellm
-    ports:
-      - "${LITELLM_PORT:-14000}:4000"
+    expose:
+      - "4000"
     volumes:
       - ./config/litellm_config.yaml:/app/config.yaml
     command: >
@@ -149,6 +149,22 @@ services:
       timeout: 5s
       retries: 3
 
+  # === LiteLLM ゲートウェイ ===
+  # /v1/models だけ backend に委譲し、他は LiteLLM へ透過転送する。
+  litellm-gateway:
+    image: nginx:1.27-alpine
+    container_name: vllm-manager-litellm-gateway
+    ports:
+      - "${LITELLM_PORT:-14000}:4000"
+    volumes:
+      - ./config/litellm_gateway.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - litellm
+      - backend
+    networks:
+      - vllm-net
+    restart: unless-stopped
+
   # === LiteLLM 永続 DB ===
   litellm-db:
     image: postgres:16-alpine
@@ -172,17 +188,19 @@ services:
         - HTTP_PROXY=${HTTP_PROXY}
         - HTTPS_PROXY=${HTTPS_PROXY}
         - NO_PROXY=${NO_PROXY}
+        - BACKEND_INTERNAL_URL=${BACKEND_INTERNAL_URL:-http://backend:8000}
         - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
         - NEXT_PUBLIC_LITELLM_URL=${NEXT_PUBLIC_LITELLM_URL}
     container_name: vllm-manager-frontend
     ports:
       - "${FRONTEND_PORT:-13000}:3000"
     environment:
+      - BACKEND_INTERNAL_URL=${BACKEND_INTERNAL_URL:-http://backend:8000}
       - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
       - NEXT_PUBLIC_LITELLM_URL=${NEXT_PUBLIC_LITELLM_URL}
     depends_on:
       - backend
-      - litellm
+      - litellm-gateway
     networks:
       - vllm-net
     restart: unless-stopped

@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import type { AppEvent, DownloadJob, LiteLLMProxyRequestRow, MetricsData, MetricsMessage } from "@/types";
 
-const WS_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+const WS_BASE = (process.env.NEXT_PUBLIC_API_URL || "").replace(/\/$/, "");
 
 export function useMetricsWebSocket() {
   const wsRef = useRef<WebSocket | null>(null);
@@ -30,9 +30,16 @@ export function useMetricsWebSocket() {
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
-    const protocol = WS_BASE.startsWith("https") ? "wss" : "ws";
-    const baseUrl = WS_BASE.replace(/https?:\/\//, "");
-    const ws = new WebSocket(`${protocol}://${baseUrl}/ws/metrics`);
+    const wsUrl = (() => {
+      if (WS_BASE) {
+        const protocol = WS_BASE.startsWith("https") ? "wss" : "ws";
+        const baseUrl = WS_BASE.replace(/https?:\/\//, "");
+        return `${protocol}://${baseUrl}/ws/metrics`;
+      }
+      const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+      return `${protocol}://${window.location.host}/ws/metrics`;
+    })();
+    const ws = new WebSocket(wsUrl);
 
     ws.onopen = () => {
       setConnected(true);

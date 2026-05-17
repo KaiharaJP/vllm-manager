@@ -33,6 +33,8 @@ services:
       - VLLM_MANAGER_ADMIN_USER=${VLLM_MANAGER_ADMIN_USER:-admin}
       - VLLM_MANAGER_ADMIN_PASSWORD=${VLLM_MANAGER_ADMIN_PASSWORD:-admin}
       - VLLM_MANAGER_DATA_DIR=/app/data
+      - PROXY_UPSTREAM_READ_TIMEOUT_SEC=${PROXY_UPSTREAM_READ_TIMEOUT_SEC:-600}
+      - PROXY_FORCE_STREAM=${PROXY_FORCE_STREAM:-true}
     deploy:
       resources:
         reservations:

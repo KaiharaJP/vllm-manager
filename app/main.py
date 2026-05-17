@@ -55,6 +55,34 @@ from app.litellm_request_track import header_marks_litellm, proxy_litellm_tracke
 BACKEND_INTERNAL_PORT = int(os.environ.get("BACKEND_INTERNAL_PORT", "8000"))
 
 
+def _proxy_upstream_read_timeout_sec() -> float:
+    raw = os.environ.get("PROXY_UPSTREAM_READ_TIMEOUT_SEC", "600")
+    try:
+        return max(30.0, float(raw))
+    except ValueError:
+        return 600.0
+
+
+def _proxy_upstream_timeout() -> httpx.Timeout:
+    return httpx.Timeout(_proxy_upstream_read_timeout_sec(), connect=10.0)
+
+
+def _env_flag(name: str, *, default: bool = True) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _should_force_stream(request: Request, cfg: dict[str, Any]) -> bool:
+    """LiteLLM 経由の chat/completions で stream=false を stream=true に上書きするか。"""
+    if not header_marks_litellm(request):
+        return False
+    if not _env_flag("PROXY_FORCE_STREAM", default=True):
+        return False
+    return bool(cfg.get("force_stream", True))
+
+
 def _is_backend_self_port(port: Any) -> bool:
     try:
         return int(port) == BACKEND_INTERNAL_PORT
@@ -66,8 +94,8 @@ def _is_backend_self_port(port: Any) -> bool:
 
 class ServerStartRequest(BaseModel):
     model_id: str
-    context_length: int = Field(default=8192, ge=1024, le=262144)
-    max_num_seqs: int = Field(default=1, ge=1, le=20)
+    context_length: int = Field(default=131072, ge=1024, le=262144)
+    max_num_seqs: int = Field(default=6, ge=1, le=20)
     default_max_tokens: int = Field(default=512, ge=1, le=262144)
     default_temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     default_top_p: float = Field(default=0.95, ge=0.0, le=1.0)
@@ -1014,6 +1042,8 @@ async def proxy_openai_compat(subpath: str, request: Request):
         for key, value in defaults.items():
             if request_payload.get(key) is None:
                 request_payload[key] = value
+        if _should_force_stream(request, cfg) and not request_payload.get("stream"):
+            request_payload["stream"] = True
         body = json.dumps(request_payload).encode("utf-8")
 
     query_items = list(request.query_params.multi_items())
@@ -1030,7 +1060,7 @@ async def proxy_openai_compat(subpath: str, request: Request):
             continue
         forward_headers[key] = value
 
-    timeout = httpx.Timeout(300.0, connect=10.0)
+    timeout = _proxy_upstream_timeout()
     # ローカル転送は環境プロキシを使わない（squid 経由で 127.0.0.1 が失敗するため）
     if (
         method == "POST"

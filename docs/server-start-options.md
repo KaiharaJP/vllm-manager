@@ -11,6 +11,15 @@
 
 - `context_length`: `8192` または `32768`
 - `max_num_seqs`: `1` 〜 `2`
+
+### Hermes / エージェント向け（並列 LLM・大プロンプト）
+
+504 / キュー待ちが出る場合は次を目安に（UI のフォーム初期値もこの方向）:
+
+- `context_length`: `131072`（128K）。256K は KV が重く `max_num_seqs` を上げにくい
+- `max_num_seqs`: `6` 〜 `8`（Hermes の並列 3 本 + 余裕）
+- `default_max_tokens`: `4096`（クライアントが明示した値はそのまま）
+- 反映後: `docker compose up -d litellm-gateway backend`（nginx タイムアウト・stream 強制）
 - `gpu_memory_mode`: `auto`
 - `tensor_parallel_size`: `1`（単GPU）
 - `gpu_devices`: `all`（または `0`）

@@ -13,7 +13,8 @@ export function useMetricsWebSocket() {
   const [downloads, setDownloads] = useState<DownloadJob[]>([]);
   const [litellmProxyRequests, setLitellmProxyRequests] = useState<LiteLLMProxyRequestRow[]>([]);
   const [connected, setConnected] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [connectionError, setConnectionError] = useState<string | null>(null);
+  const [scrapeError, setScrapeError] = useState<string | null>(null);
 
   const mergeLiteLLMRow = useCallback((row: LiteLLMProxyRequestRow) => {
     setLitellmProxyRequests((prev) => {
@@ -43,7 +44,7 @@ export function useMetricsWebSocket() {
 
     ws.onopen = () => {
       setConnected(true);
-      setError(null);
+      setConnectionError(null);
     };
 
     ws.onmessage = (event) => {
@@ -76,8 +77,11 @@ export function useMetricsWebSocket() {
         } else if (msg.type === "metrics") {
           const data = (msg as AppEvent).data as MetricsData;
           setMetrics(data);
+          setScrapeError(null);
           setHistory((prev) => [...prev.slice(-99), data]);
           setEvents((prev) => [...prev.slice(-199), msg as AppEvent]);
+        } else if (msg.type === "metrics_scrape_error") {
+          setScrapeError(msg.message ?? "Metrics scrape failed");
         } else if ((msg as AppEvent).type === "model_download") {
           const job = (msg as AppEvent).data as DownloadJob;
           setDownloads((prev) => {
@@ -86,7 +90,7 @@ export function useMetricsWebSocket() {
           });
           setEvents((prev) => [...prev.slice(-199), msg as AppEvent]);
         } else if (msg.type === "error") {
-          setError(msg.message ?? "Unknown error");
+          setScrapeError(msg.message ?? "Unknown error");
           setEvents((prev) => [...prev.slice(-199), msg as AppEvent]);
         } else if (msg.type === "litellm_proxy_request" && msg.data && typeof msg.data === "object") {
           mergeLiteLLMRow(msg.data as LiteLLMProxyRequestRow);
@@ -105,7 +109,7 @@ export function useMetricsWebSocket() {
     };
 
     ws.onerror = () => {
-      setError("WebSocket connection failed");
+      setConnectionError("WebSocket connection failed");
     };
 
     wsRef.current = ws;
@@ -118,5 +122,14 @@ export function useMetricsWebSocket() {
     };
   }, [connect]);
 
-  return { metrics, history, events, downloads, litellmProxyRequests, connected, error };
+  return {
+    metrics,
+    history,
+    events,
+    downloads,
+    litellmProxyRequests,
+    connected,
+    connectionError,
+    scrapeError,
+  };
 }

@@ -238,8 +238,8 @@ export default function ServerControl({
   const downloadedModels = models.filter((m) => Boolean(m.downloaded));
   const [form, setForm] = useState({
     model_id: config?.model_id ?? downloadedModels[0]?.id ?? "",
-    context_length: config?.context_length ?? 8192,
-    max_num_seqs: config?.max_num_seqs ?? 1,
+    context_length: config?.context_length ?? 131072,
+    max_num_seqs: config?.max_num_seqs ?? 6,
     default_max_tokens: config?.default_max_tokens ?? DEFAULT_MAX_TOKENS_FALLBACK,
     default_temperature: config?.default_temperature ?? 0.7,
     default_top_p: config?.default_top_p ?? 0.95,

@@ -98,8 +98,9 @@ def load_config() -> dict:
     ensure_data_dir()
     defaults = {
         "model_id": DEFAULT_MODELS[0]["id"],
-        "context_length": 8192,
-        "max_num_seqs": 1,
+        "context_length": 131072,
+        "max_num_seqs": 6,
+        "force_stream": True,
         "default_max_tokens": 512,
         "default_temperature": 0.7,
         "default_top_p": 0.95,

@@ -60,13 +60,21 @@ Claude Code や Hermes などから **LiteLLM（例: `:14000`）** 経由で vLL
 
 ### 2.4 前段のリバースプロキシ（nginx 等）
 
-`hinton.prv.kanazawa-it.ac.jp` のような **ホストの前に nginx 等**がある場合、
+`litellm-gateway`（`:14000`）およびホスト前段の nginx では、
 
 - `proxy_read_timeout`
 - `proxy_send_timeout`
 - アイドルタイムアウト
 
 が **backend より短い**と、backend 側の設定を伸ばしても **前段で切られる**ことがあります。症状は同様に「長時間無応答のあと切断」になります。
+
+**実装済み（本リポジトリ）:** `config/litellm_gateway.conf` で `proxy_read_timeout` / `proxy_send_timeout` を **600s**。backend は `PROXY_UPSTREAM_READ_TIMEOUT_SEC`（デフォルト 600）で整合。
+
+### 2.5 LiteLLM 経由の `stream` 強制
+
+Hermes 等が `stream: false` を送ると、prefill 完了まで HTTP レスポンスが空のままになり、499/504 の原因になりやすい。
+
+**実装済み:** LiteLLM 由来（`X-Vllm-Manager-Source: litellm`）の `chat/completions` で、`stream` 未指定/false のとき **`stream: true` に上書き**（`PROXY_FORCE_STREAM=true` がデフォルト。`config.json` の `force_stream` でも制御）。無効化は `PROXY_FORCE_STREAM=false`。
 
 ---
 

@@ -56,10 +56,49 @@ def _new_row(
         "total_tokens": None,
         "completion_chunks": 0,
         "status": "streaming" if stream else "pending",
+        "phase": "prefill",
+        "first_token_at": None,
+        "prefill_tok_s": None,
+        "gen_tok_s": None,
+        "elapsed_s": 0.0,
         "error": None,
         "started_at": now,
         "updated_at": now,
     }
+
+
+def _mark_first_token(row: dict[str, Any], *, at: float | None = None) -> None:
+    if row.get("first_token_at") is not None:
+        return
+    ts = at if at is not None else time.time()
+    row["first_token_at"] = ts
+    if row.get("phase") == "prefill":
+        row["phase"] = "generate"
+    started = float(row.get("started_at") or ts)
+    pt = row.get("prompt_tokens")
+    if isinstance(pt, int) and ts > started:
+        row["prefill_tok_s"] = pt / (ts - started)
+
+
+def _update_derived(row: dict[str, Any], *, finalize: bool = False) -> None:
+    now = time.time()
+    started = float(row.get("started_at") or now)
+    row["elapsed_s"] = max(0.0, now - started)
+
+    first_at = row.get("first_token_at")
+    if isinstance(first_at, (int, float)) and row.get("prompt_tokens") is not None:
+        pt = row["prompt_tokens"]
+        if isinstance(pt, int) and first_at > started:
+            row["prefill_tok_s"] = pt / (float(first_at) - started)
+
+    ct = row.get("completion_tokens")
+    if isinstance(first_at, (int, float)) and isinstance(ct, int) and ct > 0:
+        gen_dt = now - float(first_at)
+        if gen_dt > 0:
+            row["gen_tok_s"] = ct / gen_dt
+
+    if finalize and row.get("phase") != "error":
+        row["phase"] = "done"
 
 
 async def _register(track_id: str, row: dict[str, Any]) -> None:
@@ -84,6 +123,7 @@ async def _publish_maybe(track_id: str, *, force: bool = False) -> None:
             return
         _last_publish_ts[track_id] = now
         row["updated_at"] = now
+        _update_derived(row)
         snap = dict(row)
     await event_bus.publish("litellm_proxy_request", snap)
 
@@ -126,6 +166,8 @@ def _process_sse_data_line(row: dict[str, Any], line: bytes) -> None:
         row["prompt_tokens"] = pt
     if ct is not None:
         row["completion_tokens"] = ct
+        if ct > 0:
+            _mark_first_token(row)
     if tt is not None:
         row["total_tokens"] = tt
 
@@ -137,10 +179,15 @@ def _process_sse_data_line(row: dict[str, Any], line: bytes) -> None:
             if isinstance(delta, dict):
                 content = delta.get("content")
                 if isinstance(content, str) and content:
+                    _mark_first_token(row)
                     row["completion_chunks"] = int(row.get("completion_chunks") or 0) + 1
             text = first.get("text")
             if isinstance(text, str) and text:
+                _mark_first_token(row)
                 row["completion_chunks"] = int(row.get("completion_chunks") or 0) + 1
+            finish_reason = first.get("finish_reason")
+            if finish_reason is not None and row.get("phase") == "generate":
+                row["phase"] = "done"
 
 
 def _response_headers_from_upstream(upstream: httpx.Response) -> dict[str, str]:
@@ -214,10 +261,13 @@ async def _buffer_tracked(
                         row["total_tokens"] = tt
             except (json.JSONDecodeError, UnicodeDecodeError):
                 pass
+            _mark_first_token(row)
             row["status"] = "completed"
+            _update_derived(row, finalize=True)
         else:
             row["status"] = "error"
             row["error"] = f"HTTP {upstream.status_code}"
+            row["phase"] = "error"
 
         await _publish_maybe(track_id, force=True)
         return Response(content=content, status_code=upstream.status_code, headers=headers, media_type=ct)
@@ -280,6 +330,7 @@ async def _stream_tracked(
                         _process_sse_data_line(row, line)
                 if row.get("status") != "error":
                     row["status"] = "completed"
+                    _update_derived(row, finalize=True)
                 await _publish_maybe(track_id, force=True)
             finally:
                 await resp.aclose()

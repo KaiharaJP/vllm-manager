@@ -103,10 +103,14 @@ export interface MetricsData {
   gpu_cpu_total_gb: number;
   num_requests_running: number;
   num_requests_waiting: number;
+  num_requests_waiting_capacity: number;
+  num_requests_waiting_deferred: number;
   num_requests_swapped: number;
   iteration_tokens: number;
   time_per_output_token_ms: number;
   request_throughput_rps: number;
+  prompt_throughput_tok_s: number;
+  generation_throughput_tok_s: number;
   kv_cache_usage_perc: number;
   gpu_compute_time: number;
 }
@@ -148,6 +152,11 @@ export interface LiteLLMProxyRequestRow {
   total_tokens: number | null;
   completion_chunks: number;
   status: "streaming" | "pending" | "completed" | "error";
+  phase: "prefill" | "generate" | "done" | "error";
+  first_token_at: number | null;
+  prefill_tok_s: number | null;
+  gen_tok_s: number | null;
+  elapsed_s: number;
   error: string | null;
   started_at: number;
   updated_at: number;
@@ -168,6 +177,7 @@ export interface AppEvent {
     | "litellm_team_updated"
     | "litellm_proxy_request"
     | "litellm_proxy_snapshot"
+    | "metrics_scrape_error"
     | "error"
     | "pong";
   timestamp?: number;

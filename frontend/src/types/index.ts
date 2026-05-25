@@ -70,6 +70,10 @@ export interface ServerConfig {
   vllm_port: number;
   enable_auto_tool_choice?: boolean;
   tool_call_parser?: string;
+  force_stream?: boolean;
+  limit_mm_per_prompt?: Record<string, number> | null;
+  mm_encoder_tp_mode?: string;
+  mm_processor_cache_type?: string;
 }
 
 export interface ServerStartRequest {
@@ -89,6 +93,10 @@ export interface ServerStartRequest {
   download_model: boolean;
   enable_auto_tool_choice: boolean;
   tool_call_parser: string;
+  force_stream: boolean;
+  limit_mm_per_prompt?: Record<string, number> | null;
+  mm_encoder_tp_mode?: string;
+  mm_processor_cache_type?: string;
 }
 
 export interface ApiResponse {
@@ -160,6 +168,29 @@ export interface LiteLLMProxyRequestRow {
   error: string | null;
   started_at: number;
   updated_at: number;
+  max_tokens?: number | null;
+  message_count?: number;
+  prompt_char_est?: number;
+  request_summary?: string;
+  messages_truncated?: boolean;
+}
+
+export interface ChatMessage {
+  role?: string;
+  content?: string | unknown;
+}
+
+export interface LiteLLMProxyRequestDetail extends LiteLLMProxyRequestRow {
+  messages?: ChatMessage[];
+  messages_truncated?: boolean;
+  completed_at?: number;
+}
+
+export interface RequestHistoryListResponse {
+  requests: LiteLLMProxyRequestDetail[];
+  total: number;
+  limit: number;
+  offset: number;
 }
 
 export interface AppEvent {
@@ -194,6 +225,31 @@ export interface MetricsMessage {
 
 export interface LiteLLMStatus {
   healthy: boolean;
+  url?: string;
+  check?: string;
+}
+
+export interface ServiceHealthCheckResult {
+  checked_at: number;
+  method: string;
+  vllm: {
+    healthy: boolean;
+    running: boolean;
+    port: number;
+    model: string | null;
+    message: string;
+  };
+  litellm: {
+    liveliness: boolean;
+    readiness: boolean;
+    url: string;
+    liveliness_detail?: string | null;
+    readiness_detail?: unknown;
+  };
+  backend: {
+    healthy: boolean;
+    message: string;
+  };
 }
 
 export interface SystemGpuMetrics {

@@ -67,6 +67,62 @@ def _normalize_tool_call_parser(value: Any) -> str:
     return text
 
 
+_REJECTION_SAMPLE_ALIASES = {
+    "strict": "standard",
+    "probabilistic": "standard",
+    "standard": "standard",
+    "synthetic": "synthetic",
+}
+_SPEC_METHOD_ALIASES = {
+    "qwen3_next_mtp": "mtp",
+}
+
+_VISION_MODEL_HINTS = (
+    "qwen3-vl",
+    "qwen2-vl",
+    "qwen3.6",
+    "qwen3.5",
+    "qwen3_5",
+    "qwen2.5-vl",
+    "llava",
+    "phi-3.5-vision",
+    "phi-4-multimodal",
+    "internvl",
+    "minicpm-v",
+    "image-text-to-text",
+)
+
+
+def _model_likely_supports_vision(model_id: str) -> bool:
+    lowered = (model_id or "").lower()
+    return any(hint in lowered for hint in _VISION_MODEL_HINTS)
+
+
+def _normalize_limit_mm_per_prompt(value: Any) -> Optional[dict[str, int]]:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        out: dict[str, int] = {}
+        for key, raw in value.items():
+            if not isinstance(key, str):
+                continue
+            try:
+                out[key] = int(raw)
+            except (TypeError, ValueError):
+                continue
+        return out or None
+    return None
+
+
+def _resolve_limit_mm_for_config(config: dict) -> Optional[dict[str, int]]:
+    explicit = _normalize_limit_mm_per_prompt(config.get("limit_mm_per_prompt"))
+    if explicit is not None:
+        return explicit
+    if _model_likely_supports_vision(str(config.get("model_id") or "")):
+        return {"image": 1}
+    return None
+
+
 def _normalize_speculative_config(value: Any) -> Optional[dict[str, Any]]:
     """speculative_config を保存・起動に使える形へ正規化する。"""
     if value is None:
@@ -86,6 +142,16 @@ def _normalize_speculative_config(value: Any) -> Optional[dict[str, Any]]:
         if not isinstance(key, str):
             continue
         normalized[key] = item
+    method = normalized.get("method")
+    if isinstance(method, str):
+        normalized["method"] = _SPEC_METHOD_ALIASES.get(method, method)
+    rejection = normalized.get("rejection_sample_method")
+    if isinstance(rejection, str):
+        mapped = _REJECTION_SAMPLE_ALIASES.get(rejection.strip().lower())
+        if mapped:
+            normalized["rejection_sample_method"] = mapped
+        else:
+            normalized.pop("rejection_sample_method", None)
     return normalized or None
 
 
@@ -114,6 +180,9 @@ def load_config() -> dict:
         "speculative_config": None,
         "enable_auto_tool_choice": False,
         "tool_call_parser": "",
+        "limit_mm_per_prompt": None,
+        "mm_encoder_tp_mode": "",
+        "mm_processor_cache_type": "",
     }
     if CONFIG_FILE.exists():
         try:
@@ -134,6 +203,13 @@ def load_config() -> dict:
             )
             defaults["enable_auto_tool_choice"] = bool(defaults.get("enable_auto_tool_choice", False))
             defaults["tool_call_parser"] = _normalize_tool_call_parser(defaults.get("tool_call_parser"))
+            defaults["limit_mm_per_prompt"] = _normalize_limit_mm_per_prompt(
+                defaults.get("limit_mm_per_prompt")
+            )
+            defaults["mm_encoder_tp_mode"] = str(defaults.get("mm_encoder_tp_mode") or "").strip()
+            defaults["mm_processor_cache_type"] = str(
+                defaults.get("mm_processor_cache_type") or ""
+            ).strip()
             return defaults
         except (json.JSONDecodeError, IOError):
             pass
@@ -143,7 +219,10 @@ def load_config() -> dict:
 def save_config(config: dict) -> None:
     """設定を保存する。"""
     ensure_data_dir()
-    CONFIG_FILE.write_text(json.dumps(config, indent=2))
+    payload = dict(config)
+    if "speculative_config" in payload:
+        payload["speculative_config"] = _normalize_speculative_config(payload.get("speculative_config"))
+    CONFIG_FILE.write_text(json.dumps(payload, indent=2))
 
 
 def get_status() -> dict:
@@ -265,6 +344,24 @@ def _build_command(config: dict) -> list:
         tcp = _normalize_tool_call_parser(config.get("tool_call_parser"))
         if tcp:
             cmd.extend(["--enable-auto-tool-choice", "--tool-call-parser", tcp])
+
+    limit_mm = _resolve_limit_mm_for_config(config)
+    if limit_mm is not None:
+        cmd.extend(
+            [
+                "--limit-mm-per-prompt",
+                json.dumps(limit_mm, ensure_ascii=False, separators=(",", ":")),
+            ]
+        )
+
+    mm_tp_mode = str(config.get("mm_encoder_tp_mode") or "").strip()
+    if mm_tp_mode in {"data", "weights"}:
+        cmd.extend(["--mm-encoder-tp-mode", mm_tp_mode])
+
+    mm_cache_type = str(config.get("mm_processor_cache_type") or "").strip()
+    if mm_cache_type in {"shm", "lru"}:
+        cmd.extend(["--mm-processor-cache-type", mm_cache_type])
+
     return cmd
 
 
@@ -365,6 +462,95 @@ def _preflight_vram_check(config: dict) -> Optional[str]:
     return None
 
 
+def _is_nvfp4_style_model(model_id: str) -> bool:
+    return "nvfp4" in str(model_id).lower()
+
+
+def _target_gpu_indices(gpu_devices: str) -> list[int]:
+    value = (gpu_devices or "all").strip().lower()
+    if value == "all":
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                return list(range(torch.cuda.device_count()))
+        except Exception:
+            return []
+        return []
+    indices: list[int] = []
+    for raw in value.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+        try:
+            indices.append(int(raw))
+        except ValueError:
+            continue
+    return indices
+
+
+def _uses_blackwell_gpu(gpu_devices: str) -> bool:
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return False
+        for idx in _target_gpu_indices(gpu_devices):
+            major, _ = torch.cuda.get_device_capability(idx)
+            if major == 12:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _needs_blackwell_nvfp4_toolkit(model_id: str, gpu_devices: str) -> bool:
+    return _is_nvfp4_style_model(model_id) and _uses_blackwell_gpu(gpu_devices)
+
+
+def _preflight_cuda_toolkit_for_nvfp4(config: dict) -> Optional[str]:
+    if not _needs_blackwell_nvfp4_toolkit(
+        str(config.get("model_id", "")),
+        str(config.get("gpu_devices", "all")),
+    ):
+        return None
+    try:
+        from flashinfer.jit.cpp_ext import get_cuda_version, is_cuda_version_at_least
+    except ImportError:
+        return "FlashInfer が見つかりません。backend イメージを再ビルドしてください。"
+    version = get_cuda_version()
+    if not is_cuda_version_at_least("12.9"):
+        return (
+            "Blackwell (SM120) で NVFP4 モデルを起動するには CUDA Toolkit 12.9 以上が必要です。"
+            f" 現在: {version}。backend イメージを再ビルドしてください。"
+        )
+    return None
+
+
+def _vllm_subprocess_env(config: dict) -> dict[str, str]:
+    env = os.environ.copy()
+    cuda_home = os.environ.get("CUDA_HOME", "/usr/local/cuda")
+    env["CUDA_HOME"] = cuda_home
+    path_prefix = f"{cuda_home}/bin"
+    if path_prefix not in env.get("PATH", ""):
+        env["PATH"] = f"{path_prefix}:{env.get('PATH', '')}"
+    if _needs_blackwell_nvfp4_toolkit(
+        str(config.get("model_id", "")),
+        str(config.get("gpu_devices", "all")),
+    ):
+        try:
+            from flashinfer.jit.cpp_ext import is_cuda_version_at_least
+
+            if is_cuda_version_at_least("12.9"):
+                env["FLASHINFER_CUDA_ARCH_LIST"] = "12.0f"
+        except ImportError:
+            pass
+    devices = str(config.get("gpu_devices", "all")).strip()
+    if devices and devices.lower() != "all":
+        env["CUDA_VISIBLE_DEVICES"] = devices
+    return env
+
+
 def _auto_gpu_memory_utilization(config: dict) -> tuple[Optional[float], Optional[str]]:
     inventory = _read_gpu_inventory()
     if not inventory:
@@ -436,6 +622,10 @@ def start_server(
     vllm_port: Optional[int] = None,
     enable_auto_tool_choice: Optional[bool] = None,
     tool_call_parser: Optional[str] = None,
+    force_stream: Optional[bool] = None,
+    limit_mm_per_prompt: Optional[dict[str, int]] = None,
+    mm_encoder_tp_mode: Optional[str] = None,
+    mm_processor_cache_type: Optional[str] = None,
     download_model: bool = True,
     _memory_retry_done: bool = False,
 ) -> dict:
@@ -479,6 +669,14 @@ def start_server(
         config["enable_auto_tool_choice"] = bool(enable_auto_tool_choice)
     if tool_call_parser is not None:
         config["tool_call_parser"] = _normalize_tool_call_parser(tool_call_parser)
+    if force_stream is not None:
+        config["force_stream"] = bool(force_stream)
+    if limit_mm_per_prompt is not None:
+        config["limit_mm_per_prompt"] = _normalize_limit_mm_per_prompt(limit_mm_per_prompt)
+    if mm_encoder_tp_mode is not None:
+        config["mm_encoder_tp_mode"] = str(mm_encoder_tp_mode).strip()
+    if mm_processor_cache_type is not None:
+        config["mm_processor_cache_type"] = str(mm_processor_cache_type).strip()
 
     if config.get("enable_auto_tool_choice") and not _normalize_tool_call_parser(
         config.get("tool_call_parser")
@@ -511,6 +709,12 @@ def start_server(
             f" 詳細: {vram_check_error}"
         )
         result["steps"].append("起動前チェック: VRAM不足を検知したため起動を中止しました。")
+        return result
+
+    cuda_toolkit_error = _preflight_cuda_toolkit_for_nvfp4(config)
+    if cuda_toolkit_error:
+        result["message"] = cuda_toolkit_error
+        result["steps"].append("起動前チェック: CUDA Toolkit 不足のため起動を中止しました。")
         return result
 
     requested_port = int(config.get("vllm_port", 8001))
@@ -559,10 +763,7 @@ def start_server(
 
     try:
         log = open(LOG_FILE, "w")
-        env = os.environ.copy()
-        devices = str(config.get("gpu_devices", "all")).strip()
-        if devices and devices.lower() != "all":
-            env["CUDA_VISIBLE_DEVICES"] = devices
+        env = _vllm_subprocess_env(config)
         proc = subprocess.Popen(
             cmd,
             stdout=log,

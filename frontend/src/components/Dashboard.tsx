@@ -3,6 +3,7 @@
 import { useState, useEffect } from "react";
 import ServerControl from "@/components/ServerControl";
 import MetricsPanel from "@/components/MetricsPanel";
+import RequestHistoryPanel from "@/components/RequestHistoryPanel";
 import ConfigPanel from "@/components/ConfigPanel";
 import LogPanel from "@/components/LogPanel";
 import Header from "@/components/Header";
@@ -19,7 +20,7 @@ interface DashboardProps {
   onLogout: () => void;
 }
 
-type TabKey = "overview" | "control" | "metrics" | "models" | "users" | "litellm" | "usage" | "config" | "log";
+type TabKey = "overview" | "control" | "metrics" | "requestHistory" | "models" | "users" | "litellm" | "usage" | "config" | "log";
 const TAB_STORAGE_KEY = "vllm_manager_active_tab";
 
 export default function Dashboard({ currentUser, onLogout }: DashboardProps) {
@@ -36,7 +37,7 @@ export default function Dashboard({ currentUser, onLogout }: DashboardProps) {
     const saved = window.localStorage.getItem(TAB_STORAGE_KEY) as TabKey | null;
     if (!saved) return;
     const allowedTabs: TabKey[] = currentUser.role === "admin"
-      ? ["overview", "control", "metrics", "models", "users", "litellm", "usage", "config", "log"]
+      ? ["overview", "control", "metrics", "requestHistory", "models", "users", "litellm", "usage", "config", "log"]
       : ["overview", "metrics", "users"];
     setActiveTab(allowedTabs.includes(saved) ? saved : "overview");
   }, [currentUser.role]);
@@ -149,6 +150,9 @@ export default function Dashboard({ currentUser, onLogout }: DashboardProps) {
                 { key: "control", label: "サーバー管理" },
               ] as const : []),
               { key: "metrics", label: "モニタリング" },
+              ...(currentUser.role === "admin" ? [
+                { key: "requestHistory", label: "リクエスト履歴" },
+              ] as const : []),
               ...(currentUser.role !== "admin" ? [
                 { key: "users", label: "マイページ" },
               ] as const : []),
@@ -189,7 +193,10 @@ export default function Dashboard({ currentUser, onLogout }: DashboardProps) {
             onActionComplete={refreshStatus}
           />
         )}
-        {activeTab === "metrics" && <MetricsPanel />}
+        {activeTab === "metrics" && <MetricsPanel currentUser={currentUser} />}
+        {activeTab === "requestHistory" && currentUser.role === "admin" && (
+          <RequestHistoryPanel />
+        )}
         {activeTab === "models" && currentUser.role === "admin" && (
           <ModelManagement models={models} jobs={jobs} onChanged={refreshModels} />
         )}

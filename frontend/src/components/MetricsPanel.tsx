@@ -1,7 +1,11 @@
 "use client";
 
+import { Fragment, useState } from "react";
 import { useMetricsWebSocket } from "@/hooks/useMetricsWebSocket";
-import type { LiteLLMProxyRequestRow, MetricsData } from "@/types";
+import { api } from "@/lib/api";
+import type { AppUser, LiteLLMProxyRequestDetail, LiteLLMProxyRequestRow, MetricsData } from "@/types";
+import { RequestMessagesView } from "@/components/RequestMessagesView";
+import ServiceHealthPanel from "@/components/ServiceHealthPanel";
 import {
   AreaChart,
   Area,
@@ -13,7 +17,7 @@ import {
   ResponsiveContainer,
   Legend,
 } from "recharts";
-import { Cpu, Zap, Layers, Activity } from "lucide-react";
+import { Cpu, Zap, Layers, Activity, ChevronDown, ChevronRight } from "lucide-react";
 
 const chartTooltipStyle = {
   background: "#1a1a2e",
@@ -44,7 +48,8 @@ function m(n: MetricsData, key: keyof MetricsData, fallback = 0): number {
   return typeof v === "number" && Number.isFinite(v) ? v : fallback;
 }
 
-export default function MetricsPanel() {
+export default function MetricsPanel({ currentUser }: { currentUser: AppUser }) {
+  const isAdmin = currentUser.role === "admin";
   const { metrics, history, litellmProxyRequests, connected, connectionError, scrapeError } =
     useMetricsWebSocket();
 
@@ -92,6 +97,7 @@ export default function MetricsPanel() {
 
   return (
     <div className="space-y-6 animate-slide-in">
+      <ServiceHealthPanel />
       {scrapeError && (
         <p className="text-xs text-amber-400/90 bg-amber-400/10 border border-amber-400/30 rounded-lg px-3 py-2">
           vLLM メトリクス取得: {scrapeError}（vLLM 停止中は表示されません。起動後 5〜10 秒お待ちください）
@@ -211,7 +217,7 @@ export default function MetricsPanel() {
         </div>
       )}
 
-      <LiteLLMRequestTable rows={sortedLiteLLM} vllmRunning={vllmRunning} />
+      <LiteLLMRequestTable rows={sortedLiteLLM} vllmRunning={vllmRunning} isAdmin={isAdmin} />
 
       {history.length > 1 && (
         <ChartCard title="GPU メモリ使用量 (GB)">
@@ -334,17 +340,23 @@ function DetailRow({ label, value }: { label: string; value: string }) {
   );
 }
 
-function LiteLLMRequestTable({ rows, vllmRunning }: { rows: LiteLLMProxyRequestRow[]; vllmRunning: number }) {
+function LiteLLMRequestTable({
+  rows,
+  vllmRunning,
+  isAdmin,
+}: {
+  rows: LiteLLMProxyRequestRow[];
+  vllmRunning: number;
+  isAdmin: boolean;
+}) {
+  const [expandedId, setExpandedId] = useState<string | null>(null);
+  const [detail, setDetail] = useState<LiteLLMProxyRequestDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
   const activeRows = rows.filter((r) => r.status === "streaming" || r.status === "pending");
   const displayRows = [
     ...activeRows,
     ...rows.filter((r) => r.status !== "streaming" && r.status !== "pending"),
   ].slice(0, 20);
-
-  function formatToken(value: number | null): string {
-    if (value == null) return "—";
-    return value.toLocaleString();
-  }
 
   function phaseLabel(r: LiteLLMProxyRequestRow): string {
     const phase = r.phase ?? (r.status === "pending" ? "prefill" : "done");
@@ -352,10 +364,47 @@ function LiteLLMRequestTable({ rows, vllmRunning }: { rows: LiteLLMProxyRequestR
     return phase;
   }
 
+  async function onRowClick(id: string) {
+    if (!isAdmin) return;
+    if (expandedId === id) {
+      setExpandedId(null);
+      setDetail(null);
+      return;
+    }
+    setExpandedId(id);
+    setDetail(null);
+    setDetailLoading(true);
+    try {
+      setDetail(await api.getLiteLLMProxyRequestDetail(id));
+    } catch (e) {
+      setDetail({
+        id,
+        endpoint: "",
+        model: "",
+        stream: false,
+        prompt_tokens: null,
+        completion_tokens: null,
+        total_tokens: null,
+        completion_chunks: 0,
+        status: "error",
+        phase: "error",
+        first_token_at: null,
+        prefill_tok_s: null,
+        gen_tok_s: null,
+        elapsed_s: 0,
+        error: e instanceof Error ? e.message : String(e),
+        started_at: 0,
+        updated_at: 0,
+      });
+    } finally {
+      setDetailLoading(false);
+    }
+  }
+
   return (
     <div className="bg-bg-secondary rounded-xl border border-white/5 p-5">
-      <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
-        <h3 className="text-sm font-medium text-gray-400">LiteLLM リクエスト（X-Vllm-Manager-Source: litellm）</h3>
+      <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+        <h3 className="text-sm font-medium text-gray-400">処理中リクエスト（LiteLLM 経由）</h3>
         <div className="flex gap-2 text-xs">
           <span className="rounded-md border border-white/15 bg-bg-tertiary px-2 py-1 text-gray-300">
             Active {activeRows.length}
@@ -365,44 +414,74 @@ function LiteLLMRequestTable({ rows, vllmRunning }: { rows: LiteLLMProxyRequestR
           </span>
         </div>
       </div>
+      <p className="text-xs text-gray-500 mb-4">
+        vLLM 内部キューの個別プロンプトは表示できません。
+        {isAdmin && " 行クリックでプロンプト全文。"}
+      </p>
 
       {displayRows.length === 0 ? (
         <p className="text-sm text-gray-400 border border-dashed border-white/20 rounded-lg p-4">
-          LiteLLM 経由リクエスト待機中。chat completions を実行すると、リクエストごとのフェーズと tok/s が表示されます。
+          LiteLLM 経由リクエスト待機中。
         </p>
       ) : (
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
               <tr className="text-left text-xs text-gray-500 border-b border-white/10">
+                {isAdmin && <th className="pb-2 w-6" />}
                 <th className="pb-2 pr-3 font-medium">ID</th>
-                <th className="pb-2 pr-3 font-medium">status</th>
                 <th className="pb-2 pr-3 font-medium">phase</th>
+                <th className="pb-2 pr-3 font-medium text-right">max_tok</th>
+                <th className="pb-2 pr-3 font-medium text-right">msgs</th>
+                <th className="pb-2 pr-3 font-medium">サマリー</th>
                 <th className="pb-2 pr-3 font-medium text-right">elapsed</th>
-                <th className="pb-2 pr-3 font-medium text-right">prompt</th>
-                <th className="pb-2 pr-3 font-medium text-right">completion</th>
-                <th className="pb-2 pr-3 font-medium text-right">prefill tok/s</th>
-                <th className="pb-2 pr-3 font-medium text-right">gen tok/s</th>
+                <th className="pb-2 pr-3 font-medium text-right">prefill/s</th>
+                <th className="pb-2 pr-3 font-medium text-right">gen/s</th>
               </tr>
             </thead>
             <tbody>
               {displayRows.map((r) => (
-                <tr key={r.id} className="border-b border-white/5 hover:bg-white/[0.02]">
-                  <td className="py-2 pr-3 font-mono text-xs text-gray-400">{r.id.slice(0, 8)}…</td>
-                  <td className="py-2 pr-3">
-                    <StatusBadge status={r.status} />
-                  </td>
-                  <td className="py-2 pr-3 text-gray-300">{phaseLabel(r)}</td>
-                  <td className="py-2 pr-3 text-right font-mono">{formatElapsed(r.elapsed_s ?? 0)}</td>
-                  <td className="py-2 pr-3 text-right font-mono">{formatToken(r.prompt_tokens)}</td>
-                  <td className="py-2 pr-3 text-right font-mono">{formatToken(r.completion_tokens)}</td>
-                  <td className="py-2 pr-3 text-right font-mono">
-                    {(r.phase ?? "") === "prefill" && r.first_token_at == null
-                      ? "—"
-                      : formatTokS(r.prefill_tok_s)}
-                  </td>
-                  <td className="py-2 pr-3 text-right font-mono">{formatTokS(r.gen_tok_s)}</td>
-                </tr>
+                <Fragment key={r.id}>
+                  <tr
+                    className={`border-b border-white/5 hover:bg-white/[0.02] ${isAdmin ? "cursor-pointer" : ""}`}
+                    onClick={() => onRowClick(r.id)}
+                  >
+                    {isAdmin && (
+                      <td className="py-2 text-gray-400">
+                        {expandedId === r.id ? (
+                          <ChevronDown className="w-4 h-4" />
+                        ) : (
+                          <ChevronRight className="w-4 h-4" />
+                        )}
+                      </td>
+                    )}
+                    <td className="py-2 pr-3 font-mono text-xs text-gray-400">{r.id.slice(0, 8)}…</td>
+                    <td className="py-2 pr-3 text-gray-300">{phaseLabel(r)}</td>
+                    <td className="py-2 pr-3 text-right font-mono">{r.max_tokens ?? "—"}</td>
+                    <td className="py-2 pr-3 text-right font-mono">{r.message_count ?? "—"}</td>
+                    <td className="py-2 pr-3 text-xs text-gray-400 max-w-[180px] truncate">
+                      {r.request_summary ?? "—"}
+                    </td>
+                    <td className="py-2 pr-3 text-right font-mono">{formatElapsed(r.elapsed_s ?? 0)}</td>
+                    <td className="py-2 pr-3 text-right font-mono">
+                      {(r.phase ?? "") === "prefill" && r.first_token_at == null
+                        ? "—"
+                        : formatTokS(r.prefill_tok_s)}
+                    </td>
+                    <td className="py-2 pr-3 text-right font-mono">{formatTokS(r.gen_tok_s)}</td>
+                  </tr>
+                  {isAdmin && expandedId === r.id && (
+                    <tr className="bg-bg-tertiary/40">
+                      <td colSpan={9} className="p-4">
+                        {detailLoading ? (
+                          <p className="text-sm text-gray-400">読み込み中...</p>
+                        ) : detail && detail.id === r.id ? (
+                          <RequestMessagesView detail={detail} />
+                        ) : null}
+                      </td>
+                    </tr>
+                  )}
+                </Fragment>
               ))}
             </tbody>
           </table>
@@ -410,14 +489,4 @@ function LiteLLMRequestTable({ rows, vllmRunning }: { rows: LiteLLMProxyRequestR
       )}
     </div>
   );
-}
-
-function StatusBadge({ status }: { status: LiteLLMProxyRequestRow["status"] }) {
-  const tone =
-    status === "error"
-      ? "text-accent-danger"
-      : status === "completed"
-        ? "text-gray-400"
-        : "text-accent-success";
-  return <span className={`text-xs font-semibold ${tone}`}>{status}</span>;
 }

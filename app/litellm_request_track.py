@@ -18,11 +18,13 @@ from fastapi.responses import Response, StreamingResponse
 from starlette.requests import Request
 
 from app.event_bus import event_bus
+from app.request_history import append_record
 
 LITELLM_SOURCE_HEADER = "x-vllm-manager-source"
 LITELLM_SOURCE_VALUE = "litellm"
 
 _PUBLISH_MIN_INTERVAL = 0.25
+_MAX_MESSAGES_BYTES = 64 * 1024
 
 _active: dict[str, dict[str, Any]] = {}
 _lock = asyncio.Lock()
@@ -34,8 +36,115 @@ def header_marks_litellm(request: Request) -> bool:
     return (raw or "").strip().lower() == LITELLM_SOURCE_VALUE
 
 
+def _content_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict):
+                if part.get("type") == "text" and isinstance(part.get("text"), str):
+                    parts.append(part["text"])
+                elif isinstance(part.get("text"), str):
+                    parts.append(part["text"])
+        return "\n".join(parts)
+    return ""
+
+
+def _extract_messages(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        return [m for m in messages if isinstance(m, dict)]
+    prompt = payload.get("prompt")
+    if isinstance(prompt, str) and prompt:
+        return [{"role": "user", "content": prompt}]
+    return []
+
+
+def _extract_request_meta(payload: Optional[dict[str, Any]]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {
+            "max_tokens": None,
+            "message_count": 0,
+            "prompt_char_est": 0,
+            "request_summary": "",
+            "_messages": None,
+        }
+
+    messages = _extract_messages(payload)
+    char_est = 0
+    last_user = ""
+    for msg in messages:
+        char_est += len(_content_text(msg.get("content")))
+        role = str(msg.get("role") or "")
+        if role == "user":
+            last_user = _content_text(msg.get("content"))
+
+    max_tokens = payload.get("max_tokens")
+    try:
+        max_tokens_int = int(max_tokens) if max_tokens is not None else None
+    except (TypeError, ValueError):
+        max_tokens_int = None
+
+    preview = (last_user or _content_text(messages[-1].get("content") if messages else ""))[:120]
+    preview = preview.replace("\n", " ").strip()
+    summary = f"{len(messages)} msg, ~{char_est} chars"
+    if max_tokens_int is not None:
+        summary += f", max_tokens={max_tokens_int}"
+    if preview:
+        summary += f' — "{preview}"'
+
+    messages_store, truncated = _store_messages(messages)
+    return {
+        "max_tokens": max_tokens_int,
+        "message_count": len(messages),
+        "prompt_char_est": char_est,
+        "request_summary": summary,
+        "_messages": messages_store,
+        "messages_truncated": truncated,
+    }
+
+
+def _store_messages(messages: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+    if not messages:
+        return [], False
+    try:
+        raw = json.dumps(messages, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return messages[:1], True
+    if len(raw.encode("utf-8")) <= _MAX_MESSAGES_BYTES:
+        return messages, False
+    # 先頭から収まる分だけ保持
+    acc: list[dict[str, Any]] = []
+    for msg in messages:
+        trial = acc + [msg]
+        try:
+            if len(json.dumps(trial, ensure_ascii=False).encode("utf-8")) > _MAX_MESSAGES_BYTES:
+                break
+        except (TypeError, ValueError):
+            break
+        acc.append(msg)
+    return acc or messages[:1], True
+
+
+def _public_row(row: dict[str, Any]) -> dict[str, Any]:
+    return {k: v for k, v in row.items() if not k.startswith("_")}
+
+
 def snapshot() -> list[dict[str, Any]]:
-    return [dict(v) for v in _active.values()]
+    return [_public_row(dict(v)) for v in _active.values()]
+
+
+def get_active_detail(track_id: str) -> Optional[dict[str, Any]]:
+    row = _active.get(track_id)
+    if not row:
+        return None
+    out = _public_row(dict(row))
+    messages = row.get("_messages")
+    if messages is not None:
+        out["messages"] = messages
+        out["messages_truncated"] = bool(row.get("messages_truncated"))
+    return out
 
 
 def _new_row(
@@ -44,8 +153,10 @@ def _new_row(
     subpath: str,
     model: str,
     stream: bool,
+    request_payload: Optional[dict[str, Any]],
 ) -> dict[str, Any]:
     now = time.time()
+    meta = _extract_request_meta(request_payload)
     return {
         "id": track_id,
         "endpoint": subpath,
@@ -64,6 +175,12 @@ def _new_row(
         "error": None,
         "started_at": now,
         "updated_at": now,
+        "max_tokens": meta["max_tokens"],
+        "message_count": meta["message_count"],
+        "prompt_char_est": meta["prompt_char_est"],
+        "request_summary": meta["request_summary"],
+        "_messages": meta["_messages"],
+        "messages_truncated": meta.get("messages_truncated", False),
     }
 
 
@@ -101,6 +218,14 @@ def _update_derived(row: dict[str, Any], *, finalize: bool = False) -> None:
         row["phase"] = "done"
 
 
+async def _finalize_row(row: dict[str, Any]) -> None:
+    _update_derived(row, finalize=True)
+    try:
+        append_record(row)
+    except Exception:
+        pass
+
+
 async def _register(track_id: str, row: dict[str, Any]) -> None:
     async with _lock:
         _active[track_id] = row
@@ -124,7 +249,7 @@ async def _publish_maybe(track_id: str, *, force: bool = False) -> None:
         _last_publish_ts[track_id] = now
         row["updated_at"] = now
         _update_derived(row)
-        snap = dict(row)
+        snap = _public_row(row)
     await event_bus.publish("litellm_proxy_request", snap)
 
 
@@ -216,7 +341,13 @@ async def proxy_litellm_tracked_v1(
         model = str(request_payload.get("model") or "")
         stream = bool(request_payload.get("stream"))
 
-    row = _new_row(track_id=track_id, subpath=subpath, model=model, stream=stream)
+    row = _new_row(
+        track_id=track_id,
+        subpath=subpath,
+        model=model,
+        stream=stream,
+        request_payload=request_payload,
+    )
     await _register(track_id, row)
     await _publish_maybe(track_id, force=True)
 
@@ -228,6 +359,8 @@ async def proxy_litellm_tracked_v1(
     except Exception as exc:
         row["status"] = "error"
         row["error"] = str(exc)
+        row["phase"] = "error"
+        await _finalize_row(row)
         await _publish_maybe(track_id, force=True)
         await _unregister(track_id)
         await client.aclose()
@@ -263,17 +396,20 @@ async def _buffer_tracked(
                 pass
             _mark_first_token(row)
             row["status"] = "completed"
-            _update_derived(row, finalize=True)
+            await _finalize_row(row)
         else:
             row["status"] = "error"
             row["error"] = f"HTTP {upstream.status_code}"
             row["phase"] = "error"
+            await _finalize_row(row)
 
         await _publish_maybe(track_id, force=True)
         return Response(content=content, status_code=upstream.status_code, headers=headers, media_type=ct)
     except Exception as exc:
         row["status"] = "error"
         row["error"] = str(exc)
+        row["phase"] = "error"
+        await _finalize_row(row)
         await _publish_maybe(track_id, force=True)
         raise
     finally:
@@ -299,6 +435,8 @@ async def _stream_tracked(
         body_bytes = await resp.aread()
         row["status"] = "error"
         row["error"] = f"HTTP {resp.status_code}"
+        row["phase"] = "error"
+        await _finalize_row(row)
         await _publish_maybe(track_id, force=True)
         await _unregister(track_id)
         await resp.aclose()
@@ -320,6 +458,8 @@ async def _stream_tracked(
         except Exception as exc:
             row["status"] = "error"
             row["error"] = str(exc)
+            row["phase"] = "error"
+            await _finalize_row(row)
             await _publish_maybe(track_id, force=True)
             raise
         finally:
@@ -330,7 +470,7 @@ async def _stream_tracked(
                         _process_sse_data_line(row, line)
                 if row.get("status") != "error":
                     row["status"] = "completed"
-                    _update_derived(row, finalize=True)
+                    await _finalize_row(row)
                 await _publish_maybe(track_id, force=True)
             finally:
                 await resp.aclose()

@@ -23,7 +23,7 @@ interface ServerControlProps {
   onActionComplete: () => void;
 }
 
-type RejectionSampleMethod = "strict" | "probabilistic" | "synthetic";
+type RejectionSampleMethod = "standard" | "synthetic";
 type SpecMethod =
   | "mtp"
   | "qwen3_next_mtp"
@@ -64,6 +64,29 @@ function asBool(value: unknown, fallback: boolean): boolean {
   return fallback;
 }
 
+function modelLikelySupportsVision(modelId: string): boolean {
+  const lowered = modelId.toLowerCase();
+  const hints = [
+    "qwen3-vl",
+    "qwen2-vl",
+    "qwen3.6",
+    "qwen3.5",
+    "qwen2.5-vl",
+    "llava",
+    "phi-3.5-vision",
+    "internvl",
+    "minicpm-v",
+  ];
+  return hints.some((h) => lowered.includes(h));
+}
+
+function limitMmImageFromConfig(
+  raw: Record<string, number> | null | undefined
+): number {
+  if (!raw || typeof raw.image !== "number") return 1;
+  return Math.max(0, Math.min(8, Math.floor(raw.image)));
+}
+
 function createSpecForm(raw: Record<string, unknown> | null | undefined): SpecForm {
   const data = raw ?? {};
   const methodRaw = typeof data.method === "string" ? data.method : "ngram";
@@ -81,12 +104,11 @@ function createSpecForm(raw: Record<string, unknown> | null | undefined): SpecFo
     ? (methodRaw as SpecMethod)
     : "ngram";
   const rejectMethodRaw =
-    typeof data.rejection_sample_method === "string" ? data.rejection_sample_method : "strict";
-  const rejectionSampleMethod: RejectionSampleMethod = (
-    ["strict", "probabilistic", "synthetic"] as const
-  ).includes(rejectMethodRaw as RejectionSampleMethod)
-    ? (rejectMethodRaw as RejectionSampleMethod)
-    : "strict";
+    typeof data.rejection_sample_method === "string" ? data.rejection_sample_method : "standard";
+  const rejectionSampleMethod: RejectionSampleMethod =
+    rejectMethodRaw === "synthetic"
+      ? "synthetic"
+      : "standard";
   return {
     method,
     num_speculative_tokens: Math.max(1, Math.floor(asNumber(data.num_speculative_tokens, 2))),
@@ -252,6 +274,10 @@ export default function ServerControl({
     download_model: true,
     enable_auto_tool_choice: config?.enable_auto_tool_choice ?? false,
     tool_call_parser: config?.tool_call_parser ?? "",
+    force_stream: config?.force_stream ?? true,
+    limit_mm_image: limitMmImageFromConfig(config?.limit_mm_per_prompt),
+    mm_encoder_tp_mode: config?.mm_encoder_tp_mode ?? "",
+    mm_processor_cache_type: config?.mm_processor_cache_type ?? "",
   });
   const [specEnabled, setSpecEnabled] = useState(
     Boolean(config?.speculative_config && Object.keys(config.speculative_config).length > 0)
@@ -323,6 +349,11 @@ export default function ServerControl({
       gpu_devices: config.gpu_devices ?? prev.gpu_devices,
       enable_auto_tool_choice: config.enable_auto_tool_choice ?? prev.enable_auto_tool_choice,
       tool_call_parser: config.tool_call_parser ?? prev.tool_call_parser,
+      force_stream: config.force_stream ?? prev.force_stream,
+      limit_mm_image: limitMmImageFromConfig(config.limit_mm_per_prompt ?? undefined),
+      mm_encoder_tp_mode: config.mm_encoder_tp_mode ?? prev.mm_encoder_tp_mode,
+      mm_processor_cache_type:
+        config.mm_processor_cache_type ?? prev.mm_processor_cache_type,
     }));
   }, [config]);
 
@@ -331,9 +362,18 @@ export default function ServerControl({
     setResult(null);
     setShowSteps(true);
     try {
+      const {
+        limit_mm_image,
+        mm_encoder_tp_mode,
+        mm_processor_cache_type,
+        ...startFields
+      } = form;
       const payload: ServerStartRequest = {
-        ...form,
+        ...startFields,
         speculative_config: buildSpeculativeConfig(specEnabled, specForm),
+        limit_mm_per_prompt: { image: limit_mm_image },
+        mm_encoder_tp_mode: mm_encoder_tp_mode || undefined,
+        mm_processor_cache_type: mm_processor_cache_type || undefined,
       };
       const res = await api.startServer(payload);
       setResult(res);
@@ -752,6 +792,80 @@ export default function ServerControl({
           )}
         </div>
 
+        {/* Vision / multimodal */}
+        <div className="mb-6 rounded-lg border border-white/10 bg-bg-tertiary/40 p-4 space-y-3">
+          <FieldLabel
+            label="Vision / マルチモーダル"
+            hint="Qwen3.6 など image-text-to-text モデル向け。`--limit-mm-per-prompt` で 1 リクエストあたりの画像数上限を指定します。0 にすると Vision エンコーダが無効になります。LiteLLM 経由で画像付きリクエストを送るときは、下の「画像付きは stream 強制しない」もオン推奨です。"
+          />
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+            <div>
+              <FieldLabel
+                label="1 プロンプトあたりの画像数上限"
+                hint="vLLM の --limit-mm-per-prompt（例: image=1）。Qwen3.6 系は 1 から。0 で Vision 無効。"
+              />
+              <input
+                type="number"
+                min={0}
+                max={8}
+                value={form.limit_mm_image}
+                onChange={(e) =>
+                  setForm({
+                    ...form,
+                    limit_mm_image: Math.max(0, Math.min(8, Number(e.target.value) || 0)),
+                  })
+                }
+                disabled={isBusy}
+                className="w-full bg-bg-primary border border-white/10 rounded-lg px-3 py-2 text-sm"
+              />
+              {modelLikelySupportsVision(form.model_id) ? (
+                <p className="text-xs text-gray-500 mt-1">このモデル ID は Vision 対応の可能性が高いです。</p>
+              ) : null}
+            </div>
+            <div>
+              <FieldLabel label="mm-encoder-tp-mode（任意）" hint="TP&gt;1 や高負荷時は data を検討。" />
+              <select
+                value={form.mm_encoder_tp_mode}
+                onChange={(e) => setForm({ ...form, mm_encoder_tp_mode: e.target.value })}
+                disabled={isBusy}
+                className="w-full bg-bg-primary border border-white/10 rounded-lg px-3 py-2 text-sm"
+              >
+                <option value="">（デフォルト）</option>
+                <option value="weights">weights</option>
+                <option value="data">data</option>
+              </select>
+            </div>
+            <div>
+              <FieldLabel
+                label="mm-processor-cache-type（任意）"
+                hint="前処理キャッシュ。高負荷時は shm を検討。"
+              />
+              <select
+                value={form.mm_processor_cache_type}
+                onChange={(e) =>
+                  setForm({ ...form, mm_processor_cache_type: e.target.value })
+                }
+                disabled={isBusy}
+                className="w-full bg-bg-primary border border-white/10 rounded-lg px-3 py-2 text-sm"
+              >
+                <option value="">（デフォルト）</option>
+                <option value="lru">lru</option>
+                <option value="shm">shm</option>
+              </select>
+            </div>
+          </div>
+          <label className="flex items-center gap-2 text-sm text-gray-300">
+            <input
+              type="checkbox"
+              checked={form.force_stream}
+              onChange={(e) => setForm({ ...form, force_stream: e.target.checked })}
+              disabled={isBusy}
+            />
+            LiteLLM 経由でテキストのみのとき <code className="text-xs bg-bg-primary px-1 rounded">stream: true</code>{" "}
+            を強制（504 対策）。画像付きは自動でスキップされます。
+          </label>
+        </div>
+
         {/* Tool calling (tool_choice: auto) */}
         <div className="mb-6 rounded-lg border border-white/10 bg-bg-tertiary/40 p-4 space-y-3">
           <FieldLabel
@@ -853,7 +967,7 @@ export default function ServerControl({
                 <div>
                   <FieldLabel
                     label="rejection_sample_method"
-                    hint="提案 token の採択方式です。通常は `strict` を推奨。`synthetic` を使う場合は synthetic_acceptance_rate も指定します。"
+                    hint="提案 token の採択方式です。通常は `standard` を推奨。`synthetic` を使う場合は synthetic_acceptance_rate も指定します。"
                   />
                   <select
                     value={specForm.rejection_sample_method}
@@ -866,8 +980,7 @@ export default function ServerControl({
                     disabled={isBusy}
                     className="w-full bg-bg-primary border border-white/10 rounded-lg px-3 py-2 text-sm"
                   >
-                    <option value="strict">strict</option>
-                    <option value="probabilistic">probabilistic</option>
+                    <option value="standard">standard</option>
                     <option value="synthetic">synthetic</option>
                   </select>
                 </div>

@@ -1,7 +1,12 @@
 # Backend Dockerfile
 # FastAPI + vLLM + dependencies
+# Blackwell (SM120) NVFP4 向け FlashInfer JIT に CUDA Toolkit 12.9+ が必要
 
-FROM python:3.11-slim
+FROM nvidia/cuda:12.9.1-devel-ubuntu22.04
+
+ENV CUDA_HOME=/usr/local/cuda
+ENV PATH=/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV DEBIAN_FRONTEND=noninteractive
 
 # プロキシ環境では build 時にも明示的に引き継ぐ
 ARG HTTP_PROXY
@@ -14,43 +19,40 @@ ENV HTTP_PROXY=${HTTP_PROXY} \
     https_proxy=${HTTPS_PROXY} \
     no_proxy=${NO_PROXY}
 
-# システム依存関係
-# 一部環境で HTTP ミラーへ接続できないため HTTPS に切り替える
-RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
-    && apt-get update \
+RUN apt-get update \
     && apt-get install -y --no-install-recommends \
+    python3 \
+    python3-pip \
+    python3-dev \
     curl \
     build-essential \
     && rm -rf /var/lib/apt/lists/*
 
-# ワーキングディレクトリ
+# Blackwell (SM120) 向け nvcc が compute_120f をサポートすることを build 時に検証
+RUN nvcc --version \
+    && printf '%s\n' '__global__ void k(){}' > /tmp/sm120_test.cu \
+    && nvcc -gencode=arch=compute_120f,code=sm_120f -c /tmp/sm120_test.cu -o /tmp/sm120_test.o \
+    && rm -f /tmp/sm120_test.cu /tmp/sm120_test.o
+
 WORKDIR /app
 
-# Python 依存関係
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip3 install --no-cache-dir -r requirements.txt
 
-# vLLM のインストール (CUDA 対応)
-RUN pip install --no-cache-dir vllm
+RUN pip3 install --no-cache-dir vllm
 
-# アプリケーションコード
 COPY app/ ./app/
 COPY config/ ./config/
 
-# データディレクトリ
 RUN mkdir -p /app/data
 
-# HuggingFace キャッシュディレクトリ
 ENV HF_HOME=/root/.cache/huggingface
 ENV VLLM_MANAGER_DATA_DIR=/app/data
 RUN mkdir -p ${HF_HOME}
 
-# ポート
 EXPOSE 8000 8001
 
-# 健康チェック
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD curl -f http://localhost:8000/docs || exit 1
 
-# 起動
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -252,6 +252,9 @@ export default function ModelManagement({ models, jobs, onChanged }: ModelManage
             const latestFailedJob = jobs
               .filter((job) => job.model_id === model.id && job.status === "failed")
               .sort((a, b) => b.updated_at - a.updated_at)[0];
+            const showFailedJob =
+              Boolean(latestFailedJob) &&
+              (!latestCompletedJob || latestFailedJob.updated_at > latestCompletedJob.updated_at);
             const activeIdleSeconds = activeJob ? Math.max(0, now - activeJob.updated_at) : 0;
             const isLikelyStalled = Boolean(activeJob) && activeIdleSeconds >= 120;
             const displayStatus = activeJob
@@ -300,7 +303,7 @@ export default function ModelManagement({ models, jobs, onChanged }: ModelManage
                       最終完了: {new Date(latestCompletedJob.updated_at * 1000).toLocaleString()}
                     </p>
                   )}
-                  {!activeJob && latestFailedJob && (
+                  {!activeJob && showFailedJob && latestFailedJob && (
                     <div className="mt-2 rounded-md border border-accent-danger/30 bg-accent-danger/10 p-2">
                       <p className="text-xs font-medium text-accent-danger">
                         ダウンロード失敗

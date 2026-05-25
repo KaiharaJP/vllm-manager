@@ -136,6 +136,16 @@ LiteLLM の virtual keys、users、teams、budgets、spend logs は `litellm-db`
 | `DOCKER_COMPOSE_PROJECT_NAME` | 任意 | Docker Compose のプロジェクト名。 | `vllm-manager` |
 | `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` | 環境により必要 | Docker build、backend、standalone vLLM に渡されます。社内 proxy 環境で使います。 | 空 |
 
+### Blackwell + NVFP4 モデル（例: `*-NVFP4`）
+
+| 要件 | 説明 |
+|------|------|
+| CUDA Toolkit | **12.9 以上**（backend イメージに同梱。FlashInfer が SM120 向け FP4 カーネルを JIT コンパイルするため） |
+| GPU | Blackwell (compute capability 12.x) |
+| ホスト CUDA マウント | 通常不要。上書きする場合は 12.9+ の Toolkit のみ（`docker-compose.override.yml`） |
+
+MTP（`speculative_config`）は別要件。起動失敗時は `/app/data/vllm.log` の `flashinfer` / `nvcc` 行を確認してください。
+
 ## データの保存先
 
 - `vllm-data`: vLLM Manager の `users.json`, `config.json`, `download_jobs.json`, `models.json`, `vllm.pid`, `vllm.log`

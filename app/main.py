@@ -50,7 +50,14 @@ from app.model_manager import (
     start_download_job,
 )
 from app.metrics_scraper import MetricsScraper
-from app.litellm_request_track import header_marks_litellm, proxy_litellm_tracked_v1, snapshot as litellm_proxy_snapshot
+from app.litellm_request_track import (
+    get_active_detail,
+    header_marks_litellm,
+    proxy_litellm_tracked_v1,
+    snapshot as litellm_proxy_snapshot,
+)
+from app.service_health import check_all_services, is_inference_health_probe
+from app.request_history import get_record as get_history_record, list_records as list_history_records
 
 BACKEND_INTERNAL_PORT = int(os.environ.get("BACKEND_INTERNAL_PORT", "8000"))
 
@@ -74,13 +81,56 @@ def _env_flag(name: str, *, default: bool = True) -> bool:
     return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
-def _should_force_stream(request: Request, cfg: dict[str, Any]) -> bool:
+_MM_BLOCK_TYPES = frozenset({"image_url", "input_image", "image", "video_url", "input_video", "video"})
+
+
+def _content_has_multimodal(content: Any) -> bool:
+    if isinstance(content, list):
+        for part in content:
+            if isinstance(part, dict) and str(part.get("type") or "") in _MM_BLOCK_TYPES:
+                return True
+            if isinstance(part, dict) and _normalize_image_url_block(part):
+                return True
+    return False
+
+
+def _payload_has_multimodal(payload: Optional[dict[str, Any]]) -> bool:
+    """chat/completions または responses 相当の payload に画像・動画ブロックがあるか。"""
+    if not isinstance(payload, dict):
+        return False
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        for msg in messages:
+            if isinstance(msg, dict) and _content_has_multimodal(msg.get("content")):
+                return True
+    input_value = payload.get("input")
+    if isinstance(input_value, list):
+        for item in input_value:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("type") or "") == "message" and _content_has_multimodal(item.get("content")):
+                return True
+            if _normalize_image_url_block(item):
+                return True
+    return False
+
+
+def _should_force_stream(
+    request: Request,
+    cfg: dict[str, Any],
+    *,
+    request_payload: Optional[dict[str, Any]] = None,
+) -> bool:
     """LiteLLM 経由の chat/completions で stream=false を stream=true に上書きするか。"""
     if not header_marks_litellm(request):
         return False
     if not _env_flag("PROXY_FORCE_STREAM", default=True):
         return False
-    return bool(cfg.get("force_stream", True))
+    if not bool(cfg.get("force_stream", True)):
+        return False
+    if _payload_has_multimodal(request_payload):
+        return False
+    return True
 
 
 def _is_backend_self_port(port: Any) -> bool:
@@ -109,6 +159,10 @@ class ServerStartRequest(BaseModel):
     download_model: bool = True
     enable_auto_tool_choice: bool = False
     tool_call_parser: str = ""
+    force_stream: bool = True
+    limit_mm_per_prompt: Optional[dict[str, int]] = None
+    mm_encoder_tp_mode: str = ""
+    mm_processor_cache_type: str = ""
 
 
 class ServerStatusResponse(BaseModel):
@@ -427,6 +481,12 @@ async def api_status():
     return get_status()
 
 
+@router.get("/api/health/check")
+async def api_health_check(_: dict = Depends(get_current_user)):
+    """HTTP のみの手動ヘルスチェック（推論キューには載せない）。"""
+    return await check_all_services()
+
+
 @router.post("/api/start", response_model=ApiResponse)
 async def api_start(req: ServerStartRequest, admin: dict = Depends(require_admin)):
     """vLLM サーバーを起動"""
@@ -450,6 +510,10 @@ async def api_start(req: ServerStartRequest, admin: dict = Depends(require_admin
         download_model=req.download_model,
         enable_auto_tool_choice=req.enable_auto_tool_choice,
         tool_call_parser=req.tool_call_parser,
+        force_stream=req.force_stream,
+        limit_mm_per_prompt=req.limit_mm_per_prompt,
+        mm_encoder_tp_mode=req.mm_encoder_tp_mode or None,
+        mm_processor_cache_type=req.mm_processor_cache_type or None,
     )
     await event_bus.publish(
         "server_job",
@@ -512,6 +576,40 @@ async def api_system_metrics():
 async def api_log(tail: int = 100, _: dict = Depends(require_admin)):
     """vLLM サーバーのログを取得"""
     return {"log": get_log_lines(tail=tail)}
+
+
+@router.get("/api/admin/litellm-proxy-requests/{track_id}")
+async def api_litellm_proxy_request_detail(track_id: str, _: dict = Depends(require_admin)):
+    """処理中 LiteLLM リクエストの詳細（プロンプト全文）"""
+    detail = get_active_detail(track_id)
+    if detail is None:
+        hist = get_history_record(track_id)
+        if hist is None:
+            raise HTTPException(status_code=404, detail="Request not found")
+        return hist
+    return detail
+
+
+@router.get("/api/admin/request-history")
+async def api_request_history(
+    limit: int = 50,
+    offset: int = 0,
+    _: dict = Depends(require_admin),
+):
+    """完了済み LiteLLM リクエスト履歴"""
+    lim = max(1, min(500, limit))
+    off = max(0, offset)
+    records, total = list_history_records(limit=lim, offset=off)
+    return {"requests": records, "total": total, "limit": lim, "offset": off}
+
+
+@router.get("/api/admin/request-history/{record_id}")
+async def api_request_history_detail(record_id: str, _: dict = Depends(require_admin)):
+    """完了済みリクエスト 1 件の詳細"""
+    record = get_history_record(record_id)
+    if record is None:
+        raise HTTPException(status_code=404, detail="Request not found")
+    return record
 
 
 @router.get("/api/models")
@@ -792,31 +890,87 @@ def _stringify_content_block(value: Any) -> str:
         return str(value)
 
 
-def _content_blocks_to_text(content: Any) -> str:
+def _normalize_image_url_block(block: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Responses / Chat の画像ブロックを vLLM 向け image_url 形式へ正規化する。"""
+    block_type = str(block.get("type") or "")
+    if block_type in {"input_image", "image", "image_url"}:
+        image_url = block.get("image_url")
+        if isinstance(image_url, dict) and image_url.get("url"):
+            return {"type": "image_url", "image_url": {"url": str(image_url["url"])}}
+        if isinstance(image_url, str) and image_url.strip():
+            return {"type": "image_url", "image_url": {"url": image_url.strip()}}
+        url = block.get("url")
+        if isinstance(url, str) and url.strip():
+            return {"type": "image_url", "image_url": {"url": url.strip()}}
+    return None
+
+
+def _content_blocks_to_chat_content(content: Any) -> Any:
+    """Responses API の content blocks を chat/completions 向け content に変換する。"""
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
         return _stringify_content_block(content)
-    parts: list[str] = []
+
+    parts: list[Any] = []
     for block in content:
         if isinstance(block, str):
-            parts.append(block)
+            if block.strip():
+                parts.append({"type": "text", "text": block})
             continue
         if not isinstance(block, dict):
-            parts.append(_stringify_content_block(block))
+            text = _stringify_content_block(block)
+            if text:
+                parts.append({"type": "text", "text": text})
             continue
         block_type = str(block.get("type") or "")
+        image_part = _normalize_image_url_block(block)
+        if image_part:
+            parts.append(image_part)
+            continue
         if block_type in {"input_text", "output_text", "text"}:
-            parts.append(_stringify_content_block(block.get("text")))
+            text = _stringify_content_block(block.get("text"))
+            if text:
+                parts.append({"type": "text", "text": text})
         elif block_type == "tool_result":
-            parts.append(_stringify_content_block(block.get("content")))
+            text = _stringify_content_block(block.get("content"))
+            if text:
+                parts.append({"type": "text", "text": text})
         elif block_type == "tool_use":
-            parts.append(_stringify_content_block(block.get("input")))
+            text = _stringify_content_block(block.get("input"))
+            if text:
+                parts.append({"type": "text", "text": text})
         elif "text" in block:
-            parts.append(_stringify_content_block(block.get("text")))
+            text = _stringify_content_block(block.get("text"))
+            if text:
+                parts.append({"type": "text", "text": text})
         elif "content" in block:
-            parts.append(_stringify_content_block(block.get("content")))
-    return "".join(parts)
+            text = _stringify_content_block(block.get("content"))
+            if text:
+                parts.append({"type": "text", "text": text})
+
+    if not parts:
+        return ""
+    if len(parts) == 1 and isinstance(parts[0], dict) and parts[0].get("type") == "text":
+        return str(parts[0].get("text") or "")
+    return parts
+
+
+def _content_blocks_to_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    converted = _content_blocks_to_chat_content(content)
+    if isinstance(converted, str):
+        return converted
+    if isinstance(converted, list):
+        parts: list[str] = []
+        for block in converted:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(str(block.get("text") or ""))
+            elif isinstance(block, dict) and block.get("type") == "image_url":
+                parts.append("[image]")
+        return "".join(parts)
+    return _stringify_content_block(converted)
 
 
 def _responses_input_to_chat_messages(input_value: Any) -> list[dict[str, Any]]:
@@ -832,7 +986,7 @@ def _responses_input_to_chat_messages(input_value: Any) -> list[dict[str, Any]]:
         item_type = str(item.get("type") or "")
         if item_type == "message":
             role = str(item.get("role") or "user")
-            content_text = _content_blocks_to_text(item.get("content"))
+            content_value = _content_blocks_to_chat_content(item.get("content"))
             if role == "assistant":
                 tool_calls: list[dict[str, Any]] = []
                 for block in item.get("content", []) if isinstance(item.get("content"), list) else []:
@@ -849,12 +1003,15 @@ def _responses_input_to_chat_messages(input_value: Any) -> list[dict[str, Any]]:
                                 },
                             }
                         )
-                msg: dict[str, Any] = {"role": "assistant", "content": content_text}
+                msg: dict[str, Any] = {
+                    "role": "assistant",
+                    "content": content_value if isinstance(content_value, str) else _content_blocks_to_text(item.get("content")),
+                }
                 if tool_calls:
                     msg["tool_calls"] = tool_calls
                 messages.append(msg)
             else:
-                messages.append({"role": role, "content": content_text})
+                messages.append({"role": role, "content": content_value})
         elif item_type == "function_call_output":
             messages.append(
                 {
@@ -1042,7 +1199,9 @@ async def proxy_openai_compat(subpath: str, request: Request):
         for key, value in defaults.items():
             if request_payload.get(key) is None:
                 request_payload[key] = value
-        if _should_force_stream(request, cfg) and not request_payload.get("stream"):
+        if _should_force_stream(request, cfg, request_payload=request_payload) and not request_payload.get(
+            "stream"
+        ):
             request_payload["stream"] = True
         body = json.dumps(request_payload).encode("utf-8")
 
@@ -1068,6 +1227,7 @@ async def proxy_openai_compat(subpath: str, request: Request):
         and body
         and header_marks_litellm(request)
         and not bridge_responses_to_chat
+        and not is_inference_health_probe(request_payload)
     ):
         try:
             return await proxy_litellm_tracked_v1(

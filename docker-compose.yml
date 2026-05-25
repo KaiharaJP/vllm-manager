@@ -16,6 +16,8 @@ services:
     volumes:
       - vllm-data:/app/data
       - hf-cache:/root/.cache/huggingface
+      # 任意: ホスト CUDA Toolkit で上書きする場合は docker-compose.override.yml で
+      # ${CUDA_HOME_HOST}:/usr/local/cuda:ro を追加（12.9 未満だと Blackwell NVFP4 は失敗）
     environment:
       - HTTP_PROXY=${HTTP_PROXY}
       - HTTPS_PROXY=${HTTPS_PROXY}
@@ -145,7 +147,7 @@ services:
       test:
         [
           "CMD-SHELL",
-          "python3 -c \"import os, urllib.request; req = urllib.request.Request('http://127.0.0.1:4000/health', headers={'Authorization': 'Bearer ' + os.environ.get('LITELLM_MASTER_KEY', '')}); urllib.request.urlopen(req, timeout=5).read()\"",
+          "python3 -c \"import urllib.request; urllib.request.urlopen('http://127.0.0.1:4000/health/liveliness', timeout=5).read()\"",
         ]
       interval: 30s
       timeout: 5s

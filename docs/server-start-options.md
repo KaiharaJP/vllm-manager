@@ -153,7 +153,7 @@
 
 - `method`: 手法
 - `num_speculative_tokens`: 1ステップで提案するトークン数
-- `rejection_sample_method`: `strict | probabilistic | synthetic`
+- `rejection_sample_method`: `standard | synthetic`（旧 UI の `strict` / `probabilistic` は `standard` に変換）
 - `synthetic_acceptance_rate`: synthetic 時のみ
 
 ### 手法別の主な使いどころ
@@ -234,6 +234,21 @@
 - まず通常設定との比較を同一条件で測定
 - QPS が高すぎる/短文すぎるケースでは利得が小さいことがある
 - 手法を `ngram` ↔ `suffix` で比較し、効く方を使う
+
+---
+
+## Vision / マルチモーダル（Qwen3.6 など）
+
+| UI / config キー | vLLM CLI | 意味 |
+|------------------|----------|------|
+| 1 プロンプトあたりの画像数上限 | `--limit-mm-per-prompt '{"image":N}'` | 1 リクエストで受け付ける画像数。**N=0 で Vision エンコーダ無効**（ログに `explicitly disabled`） |
+| mm-encoder-tp-mode | `--mm-encoder-tp-mode data` | Vision エンコーダの TP モード（任意） |
+| mm-processor-cache-type | `--mm-processor-cache-type shm` | 前処理キャッシュ（任意） |
+| LiteLLM stream 強制 | `force_stream` + `PROXY_FORCE_STREAM` | テキストのみ 504 対策。**画像付きは自動で stream 強制しない** |
+
+Qwen3.6 / Qwen3-VL 系は UI で画像上限 **1** が既定です。未指定でも Vision 対応モデル ID では backend が `{"image":1}` を自動付与します。
+
+トラブル時は [vision-troubleshooting.md](./vision-troubleshooting.md) を参照してください。
 
 ---
 

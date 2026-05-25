@@ -1,5 +1,11 @@
 # LiteLLM 設定ファイル
 # vLLM をバックエンドとして登録、API キー認証を有効化
+#
+# モデル死活は推論プローブ（"test from litellm"）ではなく、
+# vllm-manager UI の「HTTP ヘルスチェック」または vLLM GET /health で確認する。
+
+general_settings:
+  health_check_skip_disabled_background_models: true
 
 model_list:
   # 汎用ルーティング:
@@ -8,6 +14,7 @@ model_list:
   - model_name: "vllm-local"
     model_info:
       mode: completion
+      disable_background_health_check: true
     litellm_params:
       model: openai/vllm-local
       api_key: "sk-no-key-required"
@@ -22,6 +29,7 @@ model_list:
   - model_name: "claude-vllm-local"
     model_info:
       mode: completion
+      disable_background_health_check: true
     litellm_params:
       model: openai/vllm-local
       api_key: "sk-no-key-required"
@@ -34,6 +42,7 @@ model_list:
   - model_name: "*"
     model_info:
       mode: completion
+      disable_background_health_check: true
     litellm_params:
       model: openai/vllm-local
       api_key: "sk-no-key-required"

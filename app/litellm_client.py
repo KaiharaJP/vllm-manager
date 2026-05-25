@@ -26,10 +26,52 @@ async def litellm_request(method: str, path: str, payload: dict[str, Any] | None
         return {"success": True}
 
 
-async def status() -> dict[str, Any]:
+async def liveliness() -> dict[str, Any]:
+    """LiteLLM プロセス生存確認（推論・キューに載せない）。"""
+    url = f"{_base_url()}/health/liveliness"
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
-            response = await client.get(f"{_base_url()}/health")
-        return {"healthy": response.status_code == 200, "url": _base_url()}
-    except Exception:
-        return {"healthy": False, "url": _base_url()}
+            response = await client.get(url)
+        body = (response.text or "").strip()[:200]
+        return {
+            "healthy": response.status_code == 200,
+            "url": _base_url(),
+            "detail": body or None,
+        }
+    except Exception as exc:
+        return {"healthy": False, "url": _base_url(), "detail": str(exc)}
+
+
+async def readiness() -> dict[str, Any]:
+    """LiteLLM がリクエスト受付可能か（DB 等・推論なし）。"""
+    url = f"{_base_url()}/health/readiness"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(url)
+        detail: Any = None
+        if response.content:
+            try:
+                detail = response.json()
+            except Exception:
+                detail = (response.text or "")[:200]
+        healthy = response.status_code == 200
+        if isinstance(detail, dict):
+            db = detail.get("db")
+            status = str(detail.get("status") or "").lower()
+            if db == "Not connected":
+                healthy = False
+            elif status not in ("connected", "healthy", ""):
+                healthy = False
+        return {"healthy": healthy, "url": _base_url(), "detail": detail}
+    except Exception as exc:
+        return {"healthy": False, "url": _base_url(), "detail": str(exc)}
+
+
+async def status() -> dict[str, Any]:
+    """後方互換: 推論 HC ではなく liveliness のみ。"""
+    live = await liveliness()
+    return {
+        "healthy": bool(live.get("healthy")),
+        "url": live.get("url") or _base_url(),
+        "check": "liveliness",
+    }

@@ -161,6 +161,8 @@ export const api = {
 
   // サーバー管理
   getStatus: () => request<import("@/types").ServerStatus>("/api/status"),
+  checkServiceHealth: () =>
+    request<import("@/types").ServiceHealthCheckResult>("/api/health/check"),
   startServer: (body: import("@/types").ServerStartRequest) =>
     request<import("@/types").ApiResponse>("/api/start", {
       method: "POST",
@@ -253,4 +255,18 @@ export const api = {
       body: JSON.stringify({ payload }),
     }),
   getLiteLLMSpend: () => request<unknown>("/api/litellm/spend"),
+
+  // モニタリング / リクエスト履歴（admin）
+  getLiteLLMProxyRequestDetail: (trackId: string) =>
+    request<import("@/types").LiteLLMProxyRequestDetail>(
+      `/api/admin/litellm-proxy-requests/${encodeURIComponent(trackId)}`
+    ),
+  getRequestHistory: (limit = 50, offset = 0) =>
+    request<import("@/types").RequestHistoryListResponse>(
+      `/api/admin/request-history?limit=${limit}&offset=${offset}`
+    ),
+  getRequestHistoryDetail: (recordId: string) =>
+    request<import("@/types").LiteLLMProxyRequestDetail>(
+      `/api/admin/request-history/${encodeURIComponent(recordId)}`
+    ),
 };

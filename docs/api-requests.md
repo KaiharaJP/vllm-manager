@@ -36,7 +36,7 @@ http://127.0.0.1:18000/v1
 公開ドメイン経由の例:
 
 ```text
-http://hinton.prv.kanazawa-it.ac.jp:18000/v1
+http://hinton.kanazawa-it.ac.jp:18000/v1
 ```
 
 ### モデル一覧

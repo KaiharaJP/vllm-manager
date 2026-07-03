@@ -1,12 +1,197 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
-import type { AppUser } from "@/types";
-import { ClipboardCopy, Key, RefreshCw, Users } from "lucide-react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+import type { AppUser, Model } from "@/types";
+import { ClipboardCopy, Info, Key, RefreshCw, Users } from "lucide-react";
 import { api } from "@/lib/api";
 
 interface UserManagementPanelProps {
   currentUser: AppUser;
+}
+
+const MODEL_SELECTOR_HINT =
+  "API キーが使える model 名を指定します。クライアント（curl / OpenAI SDK / Claude Code 等）がリクエストに書く名前と完全一致する必要があります。LiteLLM 経由（:14000）なら短いエイリアス、backend 直（:18000）なら Hugging Face ID を選ぶことが多いです。";
+
+const ALL_MODELS_HINT =
+  "どんな model 名でも利用可能なキーになります（制限なし）。個人・検証向けで、本番や共有キーでは漏洩時の影響が大きいため慎重に。選択すると下の個別指定は無効になります。";
+
+const ALIAS_SECTION_HINT =
+  "LiteLLM の設定（litellm_config.yaml）で決めた固定名です。実モデル ID の代わりに短い名前で叩けます。backend が「いま動いている vLLM」へ自動でつなぎます。";
+
+const CATALOG_SECTION_HINT =
+  "vLLM Manager に登録されている実モデル ID です。クライアントが model: \"org/name\" のようにフル ID で指定する場合に選びます。特定モデルだけ使わせたいユーザー向けの制限に向いています。";
+
+const CUSTOM_MODELS_HINT =
+  "上記一覧にない model 名を追加できます。LiteLLM またはクライアントが実際に送る文字列と完全一致させてください。複数指定する場合はカンマ区切りです。";
+
+function InfoTooltip({ text }: { text: ReactNode }) {
+  return (
+    <span className="group relative inline-flex shrink-0">
+      <Info className="h-4 w-4 cursor-help text-gray-500 transition-colors group-hover:text-accent-primary" />
+      <span className="pointer-events-none absolute left-1/2 top-6 z-30 hidden w-72 -translate-x-1/2 rounded-lg border border-white/10 bg-bg-primary p-3 text-xs font-normal leading-relaxed text-gray-300 shadow-xl group-hover:block">
+        {text}
+      </span>
+    </span>
+  );
+}
+
+function HintLabel({
+  label,
+  hint,
+  className = "text-sm font-medium text-gray-300",
+}: {
+  label: ReactNode;
+  hint: ReactNode;
+  className?: string;
+}) {
+  return (
+    <span className={`inline-flex items-center gap-1 ${className}`}>
+      {label}
+      <InfoTooltip text={hint} />
+    </span>
+  );
+}
+
+const LITELLM_ROUTE_ALIASES: {
+  id: string;
+  label: string;
+  detail: string;
+}[] = [
+  {
+    id: "vllm-local",
+    label: "汎用エイリアス（迷ったらこれ）",
+    detail:
+      "LiteLLM（:14000）経由で model に \"vllm-local\" と書くだけで、いま起動中の vLLM に接続します。Hugging Face の長いモデル ID をクライアント側に覚えなくてよく、サーバーでモデルを差し替えても設定変更が不要です。",
+  },
+  {
+    id: "claude-vllm-local",
+    label: "vllm-local と同じ転送先（別名）",
+    detail:
+      "中身は vllm-local と同じ backend → vLLM です。Claude Code などで model 名を分けて管理したいとき向け。Claude Code 専用という意味ではなく、キーとクライアントの model 名をこの名前に揃えれば使えます。",
+  },
+];
+
+function ApiKeyModelSelector({
+  catalogModels,
+  selectedModels,
+  allModelsAccess,
+  customModels,
+  onToggleAllModelsAccess,
+  onToggleModel,
+  onCustomModelsChange,
+}: {
+  catalogModels: Model[];
+  selectedModels: string[];
+  allModelsAccess: boolean;
+  customModels: string;
+  onToggleAllModelsAccess: (checked: boolean) => void;
+  onToggleModel: (modelId: string, checked: boolean) => void;
+  onCustomModelsChange: (value: string) => void;
+}) {
+  const aliasIds = new Set(LITELLM_ROUTE_ALIASES.map((a) => a.id));
+  const catalogOnly = catalogModels.filter((m) => !aliasIds.has(m.id));
+
+  return (
+    <div className="md:col-span-3 space-y-3">
+      <HintLabel label="利用できるモデル" hint={MODEL_SELECTOR_HINT} />
+      <div className="rounded-lg border border-white/10 bg-bg-tertiary/60 p-3 space-y-3">
+        <label className="flex items-start gap-2 cursor-pointer">
+          <input
+            type="checkbox"
+            className="mt-0.5 h-4 w-4 rounded border-white/20 bg-bg-tertiary"
+            checked={allModelsAccess}
+            onChange={(e) => onToggleAllModelsAccess(e.target.checked)}
+          />
+          <HintLabel
+            className="text-xs font-medium text-gray-200"
+            label="全モデル（`*`）"
+            hint={ALL_MODELS_HINT}
+          />
+        </label>
+
+        {!allModelsAccess && (
+          <>
+            <div className="border-t border-white/10 pt-3 space-y-2">
+              <HintLabel
+                className="text-[11px] font-medium text-gray-400"
+                label="LiteLLM ルートエイリアス"
+                hint={ALIAS_SECTION_HINT}
+              />
+              <div className="space-y-1.5">
+                {LITELLM_ROUTE_ALIASES.map((alias) => (
+                  <label key={alias.id} className="flex items-start gap-2 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      className="mt-0.5 h-4 w-4 shrink-0 rounded border-white/20 bg-bg-tertiary"
+                      checked={selectedModels.includes(alias.id)}
+                      onChange={(e) => onToggleModel(alias.id, e.target.checked)}
+                    />
+                    <span className="inline-flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-xs text-gray-300 min-w-0">
+                      <code className="text-gray-100">{alias.id}</code>
+                      <span className="text-gray-400">{alias.label}</span>
+                      <InfoTooltip text={alias.detail} />
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </div>
+
+            <div className="border-t border-white/10 pt-3 space-y-2">
+              <HintLabel
+                className="text-[11px] font-medium text-gray-400"
+                label="登録済みモデル（Hugging Face ID）"
+                hint={CATALOG_SECTION_HINT}
+              />
+              {catalogOnly.length > 0 ? (
+                <div className="max-h-40 overflow-y-auto space-y-1.5 pr-1">
+                  {catalogOnly.map((model) => (
+                    <label key={model.id} className="flex items-start gap-2 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        className="mt-0.5 h-4 w-4 shrink-0 rounded border-white/20 bg-bg-tertiary"
+                        checked={selectedModels.includes(model.id)}
+                        onChange={(e) => onToggleModel(model.id, e.target.checked)}
+                      />
+                      <span className="text-xs text-gray-300 break-all min-w-0">
+                        <code className="text-gray-100">{model.id}</code>
+                        {model.size ? (
+                          <span className="text-gray-500 ml-1.5">({model.size})</span>
+                        ) : null}
+                        {model.downloaded ? (
+                          <span className="text-emerald-400/80 ml-1.5">DL済</span>
+                        ) : (
+                          <span className="text-amber-400/80 ml-1.5">未DL</span>
+                        )}
+                      </span>
+                    </label>
+                  ))}
+                </div>
+              ) : (
+                <p className="text-[11px] text-gray-500">
+                  モデルカタログが空です。「モデル管理」でモデルを登録してください。
+                </p>
+              )}
+            </div>
+
+            <div className="border-t border-white/10 pt-3 space-y-1.5">
+              <label className="block">
+                <span className="mb-1 inline-flex items-center gap-1 text-[11px] font-medium text-gray-400">
+                  その他（カンマ区切りで手入力）
+                  <InfoTooltip text={CUSTOM_MODELS_HINT} />
+                </span>
+                <input
+                  className="w-full bg-bg-tertiary border border-white/10 rounded-lg px-3 py-2 text-xs"
+                  placeholder="例: custom/model-name"
+                  value={customModels}
+                  onChange={(e) => onCustomModelsChange(e.target.value)}
+                />
+              </label>
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
 }
 
 function copyTextWithFallback(text: string): boolean {
@@ -47,8 +232,11 @@ export default function UserManagementPanel({ currentUser }: UserManagementPanel
   });
   const [liteKeys, setLiteKeys] = useState<unknown>(null);
   const [apiMessage, setApiMessage] = useState<string | null>(null);
+  const [catalogModels, setCatalogModels] = useState<Model[]>([]);
   const [keyOptions, setKeyOptions] = useState({
-    models: "vllm-local",
+    selectedModels: ["vllm-local"],
+    allModelsAccess: false,
+    customModels: "",
     max_budget: "",
     budget_duration: "",
     rpm_limit: "",
@@ -90,6 +278,7 @@ export default function UserManagementPanel({ currentUser }: UserManagementPanel
   useEffect(() => {
     if (currentUser.role === "admin") {
       refreshUsers();
+      api.getModels().then(setCatalogModels).catch(() => setCatalogModels([]));
       return;
     }
     setSelectedUser(currentUser);
@@ -202,8 +391,55 @@ export default function UserManagementPanel({ currentUser }: UserManagementPanel
     if (!liteKeys) return [];
     return Array.isArray(liteKeys) ? liteKeys : [];
   }, [liteKeys, selectedUser]);
-  const normalizedModelSelection = useMemo(() => parseModels(keyOptions.models), [keyOptions.models]);
-  const hasModelSelection = normalizedModelSelection.length > 0;
+
+  const resolvedModels = useMemo(() => {
+    if (keyOptions.allModelsAccess) return ["*"];
+    const custom = parseModels(keyOptions.customModels);
+    const seen = new Set<string>();
+    const result: string[] = [];
+    for (const modelId of [...keyOptions.selectedModels, ...custom]) {
+      if (modelId && !seen.has(modelId)) {
+        seen.add(modelId);
+        result.push(modelId);
+      }
+    }
+    return result;
+  }, [keyOptions.allModelsAccess, keyOptions.selectedModels, keyOptions.customModels]);
+  const hasModelSelection = resolvedModels.length > 0;
+
+  function toggleAllModelsAccess(checked: boolean) {
+    setKeyOptions((prev) => ({
+      ...prev,
+      allModelsAccess: checked,
+      selectedModels:
+        checked || prev.selectedModels.length > 0 ? prev.selectedModels : ["vllm-local"],
+    }));
+  }
+
+  function toggleSelectedModel(modelId: string, checked: boolean) {
+    setKeyOptions((prev) => ({
+      ...prev,
+      allModelsAccess: false,
+      selectedModels: checked
+        ? [...prev.selectedModels, modelId]
+        : prev.selectedModels.filter((id) => id !== modelId),
+    }));
+  }
+
+  function buildKeyPayload() {
+    const payload: {
+      models: string[];
+      max_budget?: number;
+      budget_duration?: string;
+      rpm_limit?: number;
+      tpm_limit?: number;
+    } = { models: resolvedModels };
+    if (keyOptions.max_budget) payload.max_budget = Number(keyOptions.max_budget);
+    if (keyOptions.budget_duration) payload.budget_duration = keyOptions.budget_duration;
+    if (keyOptions.rpm_limit) payload.rpm_limit = Number(keyOptions.rpm_limit);
+    if (keyOptions.tpm_limit) payload.tpm_limit = Number(keyOptions.tpm_limit);
+    return payload;
+  }
 
   /** LiteLLM の /key/info 応答はバージョンでトップレベル key の有無が違うため複数パスから拾う */
   function pickSecretString(item: Record<string, unknown>): string {
@@ -350,17 +586,11 @@ export default function UserManagementPanel({ currentUser }: UserManagementPanel
     setApiMessage("発行中...");
     try {
       if (currentUser.role !== "admin") {
-        const models = parseModels(keyOptions.models);
-        if (!models.length) {
+        if (!resolvedModels.length) {
           setApiMessage("モデル名を1つ以上指定してください。`*` を指定すると全モデルアクセスになります。");
           return;
         }
-        const payload: any = { models: models.length ? models : ["vllm-local"] };
-        if (keyOptions.max_budget) payload.max_budget = Number(keyOptions.max_budget);
-        if (keyOptions.budget_duration) payload.budget_duration = keyOptions.budget_duration;
-        if (keyOptions.rpm_limit) payload.rpm_limit = Number(keyOptions.rpm_limit);
-        if (keyOptions.tpm_limit) payload.tpm_limit = Number(keyOptions.tpm_limit);
-        const created = await api.createMyApiKey(payload);
+        const created = await api.createMyApiKey(buildKeyPayload());
         rememberIssuedSecret(created);
         if (created && typeof created === "object" && "key" in (created as any)) {
           const k = (created as any).key;
@@ -379,17 +609,11 @@ export default function UserManagementPanel({ currentUser }: UserManagementPanel
         setApiMessage("ユーザーが選択されていません。");
         return;
       }
-      const models = parseModels(keyOptions.models);
-      if (!models.length) {
+      if (!resolvedModels.length) {
         setApiMessage("モデル名を1つ以上指定してください。`*` を指定すると全モデルアクセスになります。");
         return;
       }
-      const payload: any = { models: models.length ? models : ["vllm-local"] };
-      if (keyOptions.max_budget) payload.max_budget = Number(keyOptions.max_budget);
-      if (keyOptions.budget_duration) payload.budget_duration = keyOptions.budget_duration;
-      if (keyOptions.rpm_limit) payload.rpm_limit = Number(keyOptions.rpm_limit);
-      if (keyOptions.tpm_limit) payload.tpm_limit = Number(keyOptions.tpm_limit);
-      const created = await api.createUserApiKey(selectedUser.username, payload);
+      const created = await api.createUserApiKey(selectedUser.username, buildKeyPayload());
       rememberIssuedSecret(created);
       setApiMessage("このユーザー向けの LiteLLM API キーを発行しました");
       await refreshLiteKeys();
@@ -758,18 +982,17 @@ export default function UserManagementPanel({ currentUser }: UserManagementPanel
                   </p>
                 </div>
                 <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
-                  <label className="block">
-                    <span className="mb-1 block text-sm font-medium text-gray-300">利用できるモデル</span>
-                    <input
-                      className="w-full bg-bg-tertiary border border-white/10 rounded-lg px-3 py-2 text-xs"
-                      placeholder="例: cyankiwi/Qwen3.6-27B-AWQ-BF16-INT4（複数はカンマ区切り）"
-                      value={keyOptions.models}
-                      onChange={(e) => setKeyOptions({ ...keyOptions, models: e.target.value })}
-                    />
-                    <p className="mt-1 text-[11px] text-gray-500">
-                      `*` を指定すると全モデルアクセスキーになります。`*` 以外ではモデル名を1つ以上指定してください。
-                    </p>
-                  </label>
+                  <ApiKeyModelSelector
+                    catalogModels={catalogModels}
+                    selectedModels={keyOptions.selectedModels}
+                    allModelsAccess={keyOptions.allModelsAccess}
+                    customModels={keyOptions.customModels}
+                    onToggleAllModelsAccess={toggleAllModelsAccess}
+                    onToggleModel={toggleSelectedModel}
+                    onCustomModelsChange={(value) =>
+                      setKeyOptions((prev) => ({ ...prev, customModels: value, allModelsAccess: false }))
+                    }
+                  />
                   <label className="block">
                     <span className="mb-1 block text-sm font-medium text-gray-300">予算上限 (USD)</span>
                     <input

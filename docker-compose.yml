@@ -5,9 +5,9 @@ services:
       context: .
       dockerfile: Dockerfile.backend
       args:
-        - HTTP_PROXY=${HTTP_PROXY}
-        - HTTPS_PROXY=${HTTPS_PROXY}
-        - NO_PROXY=${NO_PROXY}
+        - HTTP_PROXY=${HTTP_PROXY:-}
+        - HTTPS_PROXY=${HTTPS_PROXY:-}
+        - NO_PROXY=${NO_PROXY:-}
     container_name: vllm-manager-backend
     pid: host
     ports:
@@ -19,13 +19,13 @@ services:
       # 任意: ホスト CUDA Toolkit で上書きする場合は docker-compose.override.yml で
       # ${CUDA_HOME_HOST}:/usr/local/cuda:ro を追加（12.9 未満だと Blackwell NVFP4 は失敗）
     environment:
-      - HTTP_PROXY=${HTTP_PROXY}
-      - HTTPS_PROXY=${HTTPS_PROXY}
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
       # プロキシ環境でもコンテナ間通信はプロキシをバイパスする
-      - NO_PROXY=${NO_PROXY},litellm,backend,litellm-db,frontend
-      - http_proxy=${HTTP_PROXY}
-      - https_proxy=${HTTPS_PROXY}
-      - no_proxy=${NO_PROXY},litellm,backend,litellm-db,frontend
+      - NO_PROXY=${NO_PROXY:-},litellm,backend,litellm-db,frontend
+      - http_proxy=${HTTP_PROXY:-}
+      - https_proxy=${HTTPS_PROXY:-}
+      - no_proxy=${NO_PROXY:-},litellm,backend,litellm-db,frontend
       - VLLM_PORT=${VLLM_PORT:-8001}
       - HF_HOME=/root/.cache/huggingface
       - HF_TOKEN=${HF_TOKEN:-}
@@ -73,12 +73,12 @@ services:
       - HF_TOKEN=${HF_TOKEN:-}
       - HUGGINGFACE_HUB_TOKEN=${HF_TOKEN:-}
       - FLASHINFER_DISABLE_VERSION_CHECK=1
-      - HTTP_PROXY=${HTTP_PROXY}
-      - HTTPS_PROXY=${HTTPS_PROXY}
-      - http_proxy=${HTTP_PROXY}
-      - https_proxy=${HTTPS_PROXY}
-      - NO_PROXY=${NO_PROXY}
-      - no_proxy=${NO_PROXY}
+      - HTTP_PROXY=${HTTP_PROXY:-}
+      - HTTPS_PROXY=${HTTPS_PROXY:-}
+      - http_proxy=${HTTP_PROXY:-}
+      - https_proxy=${HTTPS_PROXY:-}
+      - NO_PROXY=${NO_PROXY:-}
+      - no_proxy=${NO_PROXY:-}
       - MODEL_ID=${MODEL_ID:-lovedheart/Qwen3.5-9B-FP8}
       - VLLM_HOST=0.0.0.0
       - VLLM_PORT=${VLLM_PORT:-8001}
@@ -189,9 +189,9 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
       args:
-        - HTTP_PROXY=${HTTP_PROXY}
-        - HTTPS_PROXY=${HTTPS_PROXY}
-        - NO_PROXY=${NO_PROXY}
+        - HTTP_PROXY=${HTTP_PROXY:-}
+        - HTTPS_PROXY=${HTTPS_PROXY:-}
+        - NO_PROXY=${NO_PROXY:-}
         - BACKEND_INTERNAL_URL=${BACKEND_INTERNAL_URL:-http://backend:8000}
         - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
         - NEXT_PUBLIC_LITELLM_URL=${NEXT_PUBLIC_LITELLM_URL}

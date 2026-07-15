@@ -37,9 +37,12 @@ PAT **inherits the role** of the creating user. Non-admin PAT → 403 on start.
 
 #### Method 1 — CLI (recommended)
 
+Reads `VLLM_MANAGER_ADMIN_USER` / `VLLM_MANAGER_ADMIN_PASSWORD` from the repo `.env` (auto-discovered by walking up from the script, or `VLLM_MANAGER_ENV=/path/to/.env`).
+
 ```bash
-export VLLM_MANAGER_URL=http://<host>:18000
-scripts/vllm-cli.sh token create --name my-automation --username admin --password '<password>'
+# From the vllm-manager checkout (or with VLLM_MANAGER_ENV set):
+scripts/vllm-cli.sh token create --name my-automation
+# optional overrides: --username / --password
 ```
 
 #### Method 2 — Web UI
@@ -59,6 +62,30 @@ Lost after `docker compose restart backend`. Prefer PAT for automation.
 ### LiteLLM key — inference (`sk-...`)
 
 Works on `http://<host>:14000/v1/*` (chat, embeddings; rerank if gateway routes it through backend).
+
+**Do not use PAT (`vlmk_`) on `:14000`.** Obtain sk- with a logged-in PAT.
+
+**Model allow-list:** LiteLLM keys are scoped to models. For first setup / agents use **ensure** (all = `*`):
+
+```bash
+scripts/vllm-cli.sh inference-key ensure
+# Re-running with same models/alias reuses the key (no duplicates).
+# Force a new key: inference-key ensure --force
+# Restrict: inference-key ensure --models 'vllm-local,jinaai/jina-embeddings-v3'
+```
+
+PAT (`token create`) has **no** model list — it only authenticates management `/api/*`.
+
+| CLI | Auth | Notes |
+|-----|------|-------|
+| `inference-key ensure [--models] [--force]` | PAT | `POST /api/auth/me/api-keys/ensure` (preferred) |
+| `inference-key create [--models …] [--save]` | PAT | Always mints a new key |
+| `inference-key list` | PAT | `GET /api/auth/me/api-keys` |
+| `inference-key delete --key <id>` | **admin** PAT | `POST /api/litellm/keys/delete` |
+| `inference-key show` | none | Reports whether a saved/env sk- is found |
+
+Config pack: [`skills/vllm-manager/.env.example`](.env.example) → copy to `.env`.  
+Also available in UI (マイページ / ユーザ管理) and `POST /api/auth/me/api-keys`.
 
 ## Management API (selected)
 
@@ -128,9 +155,12 @@ Aliases: `vllm-local`, `claude-vllm-local`, `*` (wildcard → backend).
 | `models list [--task-type t]` | none | Filter catalog |
 | `models register <id> --task-type …` | PAT | Upsert catalog |
 | `models download` / `downloads` / `resume` / `cancel` | PAT | HF jobs |
-| `token create\|list\|revoke` | login / PAT | |
+| `token create\|list\|revoke` | login / PAT | Management PAT (`vlmk_`) |
+| `inference-key create\|list\|show` | PAT | LiteLLM sk-; `--save` → `litellm-key` file |
+| `inference-key delete --key` | admin PAT | Deletes via LiteLLM `/key/delete` |
 
-Environment: `VLLM_MANAGER_URL`, `VLLM_MANAGER_TOKEN`, `VLLM_MANAGER_USERNAME`, `VLLM_MANAGER_PASSWORD`, `VLLM_MANAGER_CONFIG`.
+Environment: `VLLM_MANAGER_URL`, `VLLM_MANAGER_TOKEN`, `VLLM_MANAGER_ENV` (path to `.env`), `VLLM_MANAGER_CONFIG`, `LITELLM_API_KEY` / `VLLM_MANAGER_SK_KEY`.  
+`token create` credentials: flags → `VLLM_MANAGER_USERNAME`/`PASSWORD` → `.env` `VLLM_MANAGER_ADMIN_USER`/`PASSWORD`.
 
 ## Troubleshooting
 
@@ -139,6 +169,7 @@ Environment: `VLLM_MANAGER_URL`, `VLLM_MANAGER_TOKEN`, `VLLM_MANAGER_USERNAME`, 
 | 401 on `/api/*` | Missing/invalid PAT; re-run `token create` |
 | 403 Admin role required | Non-admin PAT — recreate with admin |
 | 401 with `sk-` on `/api/*` | Wrong token type |
+| 401 on `:14000/v1/*` | Missing sk-; run `inference-key create --save` |
 | 503 on `/v1/embeddings` | No embedding instance running |
 | 503 on `/v1/score` | No rerank instance running |
 | Rerank start fails for Ruri CrossEncoder | Expected — use vLLM-native models (e.g. BGE) or Phase 2 |

@@ -55,6 +55,7 @@ from app.audit_log import read_recent as read_audit_log
 from app.event_bus import event_bus
 from app.litellm_client import litellm_request, status as litellm_status
 from app.chat_keys import chat_key_allows_wildcard, get_or_create_chat_key, regenerate_chat_key
+from app.cli_inference_keys import DEFAULT_KEY_ALIAS, ensure_cli_inference_key
 from app.model_manager import (
     cancel_active_download_jobs,
     delete_model,
@@ -265,10 +266,17 @@ class SelfUserUpdateRequest(BaseModel):
 
 class SelfApiKeyRequest(BaseModel):
     models: list[str] = Field(..., min_length=1)
+    key_alias: Optional[str] = Field(default=None, max_length=128)
     max_budget: Optional[float] = None
     budget_duration: Optional[str] = None
     rpm_limit: Optional[int] = None
     tpm_limit: Optional[int] = None
+
+
+class SelfApiKeyEnsureRequest(BaseModel):
+    models: list[str] = Field(default_factory=lambda: ["*"], min_length=1)
+    key_alias: str = Field(default=DEFAULT_KEY_ALIAS, min_length=1, max_length=128)
+    force: bool = False
 
 
 class SelfTokenCreateRequest(BaseModel):
@@ -278,6 +286,7 @@ class SelfTokenCreateRequest(BaseModel):
 
 class AdminUserApiKeyRequest(BaseModel):
     models: list[str] = Field(..., min_length=1)
+    key_alias: Optional[str] = Field(default=None, max_length=128)
     max_budget: Optional[float] = None
     budget_duration: Optional[str] = None
     rpm_limit: Optional[int] = None
@@ -556,6 +565,8 @@ async def api_my_litellm_create_key(req: SelfApiKeyRequest, user: dict = Depends
         "team_id": user.get("litellm_team_id") or None,
         "models": models,
     }
+    if req.key_alias and req.key_alias.strip():
+        payload["key_alias"] = req.key_alias.strip()
     if req.max_budget is not None:
         payload["max_budget"] = req.max_budget
     if req.budget_duration:
@@ -567,6 +578,31 @@ async def api_my_litellm_create_key(req: SelfApiKeyRequest, user: dict = Depends
     data = await litellm_request("POST", "/key/generate", payload)
     await event_bus.publish("litellm_key_updated", data, message="self key generated", actor=user["username"])
     return data
+
+
+@router.post("/api/auth/me/api-keys/ensure")
+async def api_my_litellm_ensure_key(req: SelfApiKeyEnsureRequest, user: dict = Depends(get_current_user)):
+    """Get-or-create LiteLLM sk- for CLI/agents (same alias + models → reuse)."""
+    models = _sanitize_models(req.models)
+    try:
+        result = await ensure_cli_inference_key(
+            user,
+            models=models,
+            key_alias=req.key_alias,
+            force=req.force,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except httpx.HTTPStatusError as exc:
+        detail = (exc.response.text or str(exc))[:500]
+        raise HTTPException(status_code=502, detail=f"LiteLLM key ensure failed: {detail}") from exc
+    await event_bus.publish(
+        "litellm_key_updated",
+        {"key_alias": result.get("key_alias"), "reused": result.get("reused"), "models": result.get("models")},
+        message="cli key ensured",
+        actor=user["username"],
+    )
+    return result
 
 
 @router.get("/api/users/{username}/api-keys")
@@ -601,6 +637,8 @@ async def api_user_litellm_create_key(username: str, req: AdminUserApiKeyRequest
         "team_id": u.get("litellm_team_id") or None,
         "models": models,
     }
+    if req.key_alias and req.key_alias.strip():
+        payload["key_alias"] = req.key_alias.strip()
     if req.max_budget is not None:
         payload["max_budget"] = req.max_budget
     if req.budget_duration:

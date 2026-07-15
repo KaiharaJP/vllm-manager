@@ -4,18 +4,22 @@
 # Requires: curl, jq
 #
 # Environment:
-#   VLLM_MANAGER_URL      Backend base URL (default: http://localhost:18000)
+#   VLLM_MANAGER_URL      Backend base URL (default: http://localhost:$BACKEND_PORT from .env)
 #   VLLM_MANAGER_TOKEN    Bearer token (overrides saved token file)
-#   VLLM_MANAGER_USERNAME Login username for `token create`
-#   VLLM_MANAGER_PASSWORD Login password for `token create`
+#   VLLM_MANAGER_USERNAME Login username for `token create` (else .env ADMIN_USER)
+#   VLLM_MANAGER_PASSWORD Login password for `token create` (else .env ADMIN_PASSWORD)
+#   VLLM_MANAGER_ENV      Explicit path to vllm-manager .env
 #   VLLM_MANAGER_CONFIG   Config directory (default: ~/.config/vllm-manager)
+#   LITELLM_API_KEY / VLLM_MANAGER_SK_KEY  Inference key override (sk-...)
+#   LITELLM_URL           Inference gateway (docs/examples; default :14000)
 
 set -euo pipefail
 
-BASE_URL="${VLLM_MANAGER_URL:-http://localhost:18000}"
-BASE_URL="${BASE_URL%/}"
-CONFIG_DIR="${VLLM_MANAGER_CONFIG:-${HOME}/.config/vllm-manager}"
-TOKEN_FILE="${CONFIG_DIR}/token"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Resolve symlink (skills/.cursor → skills/vllm-manager)
+if [[ -L "${BASH_SOURCE[0]}" ]]; then
+  SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+fi
 
 die() {
   echo "error: $*" >&2
@@ -25,6 +29,91 @@ die() {
 need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "'$1' is required but not installed"
 }
+
+# Load KEY=VALUE from .env without overriding already-exported vars.
+# Supports optional single/double quotes; skips comments and blank lines.
+load_env_file() {
+  local file="$1"
+  [[ -f "$file" && -r "$file" ]] || return 1
+  local line key val
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" =~ ^[[:space:]]*$ ]] && continue
+    [[ "$line" == export\ * ]] && line="${line#export }"
+    if [[ "$line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      key="${BASH_REMATCH[1]}"
+      val="${BASH_REMATCH[2]}"
+      if [[ "$val" =~ ^\"(.*)\"$ ]]; then
+        val="${BASH_REMATCH[1]}"
+      elif [[ "$val" =~ ^\'(.*)\'$ ]]; then
+        val="${BASH_REMATCH[1]}"
+      fi
+      if [[ -z "${!key+x}" ]]; then
+        export "${key}=${val}"
+      fi
+    fi
+  done <"$file"
+  return 0
+}
+
+find_dotenv() {
+  if [[ -n "${VLLM_MANAGER_ENV:-}" ]]; then
+    printf '%s' "$VLLM_MANAGER_ENV"
+    return 0
+  fi
+  # Prefer skills/vllm-manager/.env next to this script package.
+  local skill_env
+  skill_env="$(cd "${SCRIPT_DIR}/.." && pwd)/.env"
+  if [[ -f "$skill_env" ]]; then
+    printf '%s' "$skill_env"
+    return 0
+  fi
+  local dir candidate
+  dir="$SCRIPT_DIR"
+  local i
+  for i in 1 2 3 4 5 6; do
+    candidate="${dir}/.env"
+    if [[ -f "$candidate" ]]; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+    if [[ -f "${dir}/docker-compose.yml" && -f "${dir}/.env.example" && -f "${dir}/.env" ]]; then
+      printf '%s' "${dir}/.env"
+      return 0
+    fi
+    [[ "$dir" == "/" ]] && break
+    dir="$(dirname "$dir")"
+  done
+  if [[ -f "${PWD}/.env" ]]; then
+    printf '%s' "${PWD}/.env"
+    return 0
+  fi
+  return 1
+}
+
+DOTENV_FILE=""
+if DOTENV_FILE="$(find_dotenv)"; then
+  load_env_file "$DOTENV_FILE" || true
+fi
+
+if [[ -z "${VLLM_MANAGER_URL:-}" ]]; then
+  if [[ -n "${BACKEND_PORT:-}" ]]; then
+    VLLM_MANAGER_URL="http://localhost:${BACKEND_PORT}"
+  else
+    VLLM_MANAGER_URL="http://localhost:18000"
+  fi
+fi
+if [[ -z "${LITELLM_URL:-}" && -n "${NEXT_PUBLIC_LITELLM_URL:-}" ]]; then
+  LITELLM_URL="${NEXT_PUBLIC_LITELLM_URL}"
+elif [[ -z "${LITELLM_URL:-}" && -n "${LITELLM_PORT:-}" ]]; then
+  LITELLM_URL="http://localhost:${LITELLM_PORT}"
+fi
+
+BASE_URL="${VLLM_MANAGER_URL%/}"
+CONFIG_DIR="${VLLM_MANAGER_CONFIG:-${HOME}/.config/vllm-manager}"
+TOKEN_FILE="${CONFIG_DIR}/token"
+SK_KEY_FILE="${CONFIG_DIR}/litellm-key"
 
 load_token() {
   if [[ -n "${VLLM_MANAGER_TOKEN:-}" ]]; then
@@ -44,6 +133,35 @@ save_token() {
   umask 077
   printf '%s' "$token" >"$TOKEN_FILE"
   chmod 600 "$TOKEN_FILE"
+}
+
+load_sk_key() {
+  if [[ -n "${LITELLM_API_KEY:-}" ]]; then
+    printf '%s' "$LITELLM_API_KEY"
+    return 0
+  fi
+  if [[ -n "${VLLM_MANAGER_SK_KEY:-}" ]]; then
+    printf '%s' "$VLLM_MANAGER_SK_KEY"
+    return 0
+  fi
+  if [[ -f "$SK_KEY_FILE" ]]; then
+    tr -d '\n' <"$SK_KEY_FILE"
+    return 0
+  fi
+  return 1
+}
+
+save_sk_key() {
+  local key="$1"
+  mkdir -p "$CONFIG_DIR"
+  umask 077
+  printf '%s' "$key" >"$SK_KEY_FILE"
+  chmod 600 "$SK_KEY_FILE"
+}
+
+extract_sk_key() {
+  local resp="$1"
+  printf '%s' "$resp" | jq -r '.key // .token // .api_key // empty'
 }
 
 api_request() {
@@ -102,9 +220,14 @@ Commands:
   models downloads                    List download jobs
   models resume <model_id>            Resume stalled download from cache
   models cancel <model_id>            Cancel active downloads for a model
-  token create --name <name>          Login and create a persistent API token
+  token create --name <name>          Login and create a persistent API token (vlmk_)
   token list                          List your API tokens
   token revoke <token_id>             Revoke an API token
+  inference-key create [options]      Create LiteLLM inference key (sk-); needs PAT
+  inference-key ensure [options]      Get-or-create sk- (reuse same models/alias)
+  inference-key list                  List your LiteLLM keys
+  inference-key delete --key <id>     Delete LiteLLM key (admin PAT required)
+  inference-key show                  Print saved/env inference key path status
 
 Start options:
   --context-length <n>                Context length (default: 131072 chat / 8192 pooling)
@@ -125,16 +248,42 @@ models register options:
 Token create options:
   --name <name>                       Token display name (required)
   --expires-in-days <n>               Optional expiry in days
-  --username <user>                   Login username (or VLLM_MANAGER_USERNAME)
-  --password <pass>                   Login password (or VLLM_MANAGER_PASSWORD)
+  --username <user>                   Override login user
+  --password <pass>                   Override login password
+
+  Credential resolution (first match):
+    flags → VLLM_MANAGER_USERNAME/PASSWORD → .env VLLM_MANAGER_ADMIN_USER/PASSWORD
+
+inference-key create options:
+  --models <m1,m2|*>                  Allowed models (default: * = all; or .env VLLM_MANAGER_INFERENCE_MODELS)
+  --save                              Save sk- to ~/.config/vllm-manager/litellm-key
+
+inference-key ensure options:
+  --models <m1,m2|*>                  Same as create (default *)
+  --force                             Mint a new key even if one already exists
+  (always saves to litellm-key; prefers server-side reuse via /api-keys/ensure)
+
+  Model scope (LiteLLM sk- only; PAT has no model list):
+    *     all models / aliases (recommended for agents & first setup)
+    ids   comma-separated allow-list, e.g. vllm-local,Qwen/Qwen2.5-7B-Instruct
+
+Notes:
+  PAT (vlmk_) is for management /api/*. Inference via :14000 needs sk- (separate file).
+  Auto-loads skills/vllm-manager/.env first, then walks up, or VLLM_MANAGER_ENV=path.
 
 Environment:
-  VLLM_MANAGER_URL                    Backend URL (default: http://localhost:18000)
-  VLLM_MANAGER_TOKEN                  Bearer token override
+  VLLM_MANAGER_URL                    Backend URL (default from .env BACKEND_PORT)
+  VLLM_MANAGER_TOKEN                  Bearer token override (PAT)
   VLLM_MANAGER_CONFIG                 Config dir (default: ~/.config/vllm-manager)
+  VLLM_MANAGER_ENV                    Path to .env (optional)
+  LITELLM_API_KEY / VLLM_MANAGER_SK_KEY  Inference key override
+  LITELLM_URL                         Inference gateway URL for curl examples
 
 Examples:
-  $0 token create --name my-automation --username admin --password 'secret'
+  $0 token create --name my-automation    # uses .env admin user/password
+  $0 inference-key ensure                 # get-or-create models=* (preferred)
+  $0 inference-key create --save          # always mint new (prefer ensure)
+  $0 inference-key create --models 'vllm-local' --save
   $0 status
   $0 models list --task-type embedding
   $0 models register BAAI/bge-reranker-v2-m3 --task-type rerank --context-length 8192
@@ -424,8 +573,8 @@ cmd_models_cancel() {
 cmd_token_create() {
   local name=""
   local expires_in_days=""
-  local username="${VLLM_MANAGER_USERNAME:-}"
-  local password="${VLLM_MANAGER_PASSWORD:-}"
+  local username="${VLLM_MANAGER_USERNAME:-${VLLM_MANAGER_ADMIN_USER:-}}"
+  local password="${VLLM_MANAGER_PASSWORD:-${VLLM_MANAGER_ADMIN_PASSWORD:-}}"
 
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -452,8 +601,15 @@ cmd_token_create() {
   done
 
   [[ -n "$name" ]] || die "--name is required"
-  [[ -n "$username" ]] || die "username required (--username or VLLM_MANAGER_USERNAME)"
-  [[ -n "$password" ]] || die "password required (--password or VLLM_MANAGER_PASSWORD)"
+  if [[ -z "$username" || -z "$password" ]]; then
+    local hint="set VLLM_MANAGER_ADMIN_USER/PASSWORD in .env"
+    if [[ -n "${DOTENV_FILE:-}" ]]; then
+      hint="loaded ${DOTENV_FILE} but admin credentials missing; or pass --username/--password"
+    else
+      hint="no .env found (set VLLM_MANAGER_ENV=/path/to/vllm-manager/.env) or pass --username/--password"
+    fi
+    die "username/password required (${hint})"
+  fi
 
   local login_body session_token create_body resp raw_token
   login_body="$(jq -n --arg username "$username" --arg password "$password" '{username: $username, password: $password}')"
@@ -498,6 +654,152 @@ cmd_token_revoke() {
   local token_id="${1:-}"
   [[ -n "$token_id" ]] || die "token_id is required"
   api_request DELETE "/api/auth/me/tokens/${token_id}" | jq .
+}
+
+cmd_inference_key_create() {
+  # Default: all models (*). Override via --models or VLLM_MANAGER_INFERENCE_MODELS in .env.
+  local models="${VLLM_MANAGER_INFERENCE_MODELS:-*}"
+  local do_save=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --models)
+        models="${2:-}"
+        shift 2
+        ;;
+      --save)
+        do_save=1
+        shift
+        ;;
+      *)
+        die "Unknown option: $1"
+        ;;
+    esac
+  done
+  [[ -n "$models" ]] || die "--models must not be empty"
+
+  local create_body resp raw_key
+  create_body="$(jq -n --arg models "$models" '
+    ($models | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))) as $m
+    | {models: (if ($m | length) == 0 then ["*"] else $m end)}
+  ')"
+
+  resp="$(api_request POST "/api/auth/me/api-keys" "$create_body")"
+  raw_key="$(extract_sk_key "$resp")"
+  [[ -n "$raw_key" ]] || die "Failed to create inference key: no key in response"
+
+  if [[ "$do_save" -eq 1 ]]; then
+    save_sk_key "$raw_key"
+    echo "LiteLLM inference key created (models=${models}) and saved to ${SK_KEY_FILE}"
+    printf '%s\n' "$resp" | jq --arg path "$SK_KEY_FILE" --arg prefix "${raw_key:0:8}" --arg models "$models" '
+      del(.key, .token, .api_key) + {key_saved: true, key_file: $path, key_prefix: $prefix, models: ($models | split(",") )}
+    '
+  else
+    printf '%s\n' "$resp" | jq .
+    echo "Tip: re-run with --save to store in ${SK_KEY_FILE} (raw sk- is only shown once)." >&2
+  fi
+}
+
+cmd_inference_key_ensure() {
+  local models="${VLLM_MANAGER_INFERENCE_MODELS:-*}"
+  local force=0
+  local alias="${VLLM_MANAGER_INFERENCE_KEY_ALIAS:-vllm-cli}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --models)
+        models="${2:-}"
+        shift 2
+        ;;
+      --alias)
+        alias="${2:-}"
+        shift 2
+        ;;
+      --force)
+        force=1
+        shift
+        ;;
+      *)
+        die "Unknown option: $1"
+        ;;
+    esac
+  done
+  [[ -n "$models" ]] || die "--models must not be empty"
+  [[ -n "$alias" ]] || die "--alias must not be empty"
+
+  local force_json=false
+  [[ "$force" -eq 1 ]] && force_json=true
+
+  local body resp raw_key reused
+  body="$(jq -n --arg models "$models" --arg alias "$alias" --argjson force "$force_json" '
+    ($models | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))) as $m
+    | {
+        models: (if ($m | length) == 0 then ["*"] else $m end),
+        key_alias: $alias,
+        force: $force
+      }
+  ')"
+
+  resp="$(api_request POST "/api/auth/me/api-keys/ensure" "$body")"
+  raw_key="$(extract_sk_key "$resp")"
+  [[ -n "$raw_key" ]] || die "Failed to ensure inference key: no key in response"
+  reused="$(printf '%s' "$resp" | jq -r '.reused // false')"
+
+  save_sk_key "$raw_key"
+  if [[ "$reused" == "true" ]]; then
+    echo "Reused inference key (alias=${alias}, models=${models}) → ${SK_KEY_FILE}"
+  else
+    echo "Created inference key (alias=${alias}, models=${models}) → ${SK_KEY_FILE}"
+  fi
+  printf '%s\n' "$resp" | jq --arg path "$SK_KEY_FILE" --arg prefix "${raw_key:0:8}" '
+    del(.key, .token, .api_key) + {key_saved: true, key_file: $path, key_prefix: $prefix}
+  '
+}
+
+cmd_inference_key_list() {
+  api_request GET "/api/auth/me/api-keys" | jq .
+}
+
+cmd_inference_key_delete() {
+  local key_id=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --key)
+        key_id="${2:-}"
+        shift 2
+        ;;
+      *)
+        if [[ -z "$key_id" && "$1" != --* ]]; then
+          key_id="$1"
+          shift
+        else
+          die "Unknown option: $1"
+        fi
+        ;;
+    esac
+  done
+  [[ -n "$key_id" ]] || die "--key <hash_or_sk> is required (admin PAT required)"
+
+  local body
+  body="$(jq -n --arg k "$key_id" '{payload: {keys: [$k]}}')"
+  api_request POST "/api/litellm/keys/delete" "$body" | jq .
+}
+
+cmd_inference_key_show() {
+  local key=""
+  if key="$(load_sk_key)"; then
+    local source="file"
+    if [[ -n "${LITELLM_API_KEY:-}" ]]; then
+      source="LITELLM_API_KEY"
+    elif [[ -n "${VLLM_MANAGER_SK_KEY:-}" ]]; then
+      source="VLLM_MANAGER_SK_KEY"
+    else
+      source="$SK_KEY_FILE"
+    fi
+    jq -n --arg source "$source" --arg prefix "${key:0:8}" \
+      '{found: true, source: $source, key_prefix: $prefix}'
+  else
+    jq -n --arg path "$SK_KEY_FILE" \
+      '{found: false, hint: ("run inference-key create --save or set LITELLM_API_KEY"), expected_file: $path}'
+  fi
 }
 
 main() {
@@ -571,6 +873,30 @@ main() {
           ;;
         *)
           die "Unknown token subcommand: ${sub:-<none>}. Use: create | list | revoke"
+          ;;
+      esac
+      ;;
+    inference-key)
+      local sub="${1:-}"
+      shift || true
+      case "$sub" in
+        create)
+          cmd_inference_key_create "$@"
+          ;;
+        ensure)
+          cmd_inference_key_ensure "$@"
+          ;;
+        list)
+          cmd_inference_key_list
+          ;;
+        delete)
+          cmd_inference_key_delete "$@"
+          ;;
+        show)
+          cmd_inference_key_show
+          ;;
+        *)
+          die "Unknown inference-key subcommand: ${sub:-<none>}. Use: create | ensure | list | delete | show"
           ;;
       esac
       ;;

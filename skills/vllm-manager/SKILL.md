@@ -32,6 +32,19 @@ Supports three **task types** (vLLM processes):
 
 PAT cannot call LiteLLM inference. `sk-` cannot call `/api/start`. Chat UI uses session JWT only.
 
+### Which “token” and which models?
+
+| Step | Token | Model selection |
+|------|-------|-----------------|
+| `token create` | PAT `vlmk_` | **None** — management only (start/stop/download) |
+| `inference-key create` | LiteLLM `sk-` | **Yes** — allow-list for `:14000/v1/*` (prefer **ensure**) |
+
+For agents and first setup, issue an sk- with **all models** via **ensure** (get-or-create; no duplicate keys):
+
+- Default: `models=["*"]`, alias `vllm-cli` (`VLLM_MANAGER_INFERENCE_MODELS=*` in skill `.env`)
+- Same models + alias → returns the existing key (server-stored)
+- Restrict later: `--models vllm-local,...` or `--force` to mint a new one
+
 ## Admin API authentication — how to obtain
 
 When the user sees **401 Unauthorized**, **403 Admin role required**, or **「管理者APIの認証が必要」**:
@@ -40,11 +53,19 @@ When the user sees **401 Unauthorized**, **403 Admin role required**, or **「�
 2. Start/stop/download require **admin** role.
 
 ```bash
-export VLLM_MANAGER_URL=http://<host>:18000
+export VLLM_MANAGER_URL=http://<host>:18000   # optional; else skills .env / BACKEND_PORT
 CLI=skills/vllm-manager/scripts/vllm-cli.sh   # adjust path
 
-$CLI token create --name automation --username admin --password '<password>'
+# Credentials + defaults from skills/vllm-manager/.env
+$CLI token create --name automation
+$CLI inference-key ensure                 # models=* get-or-create (no duplicates)
 $CLI status
+```
+
+If the skill is installed outside the repo, keep using `skills/vllm-manager/.env` or:
+
+```bash
+export VLLM_MANAGER_ENV=/path/to/skills/vllm-manager/.env
 ```
 
 Full auth guide: [reference.md](reference.md#admin-api-authentication).
@@ -53,12 +74,13 @@ Full auth guide: [reference.md](reference.md#admin-api-authentication).
 
 ```bash
 cp -r /path/to/vllm-manager/skills/vllm-manager ~/.cursor/skills/
-export VLLM_MANAGER_URL=http://<host>:18000
-~/.cursor/skills/vllm-manager/scripts/vllm-cli.sh token create \
-  --name automation --username admin --password '<password>'
+# Edit ~/.cursor/skills/vllm-manager/.env (from .env.example)
+CLI=~/.cursor/skills/vllm-manager/scripts/vllm-cli.sh
+$CLI token create --name automation
+$CLI inference-key ensure                 # all models (*); reuses if already issued
 ```
 
-Requires `curl` and `jq`.
+Requires `curl` and `jq`. PAT → `~/.config/vllm-manager/token`; sk- → `~/.config/vllm-manager/litellm-key`.
 
 ## Common workflows
 
@@ -72,9 +94,11 @@ $CLI instances
 $CLI smoke-test <instance_id>
 ```
 
-Inference (LiteLLM):
+Inference (LiteLLM) — use sk- from `inference-key create --save` (or `LITELLM_API_KEY`):
 
 ```bash
+export LITELLM_URL="${LITELLM_URL:-http://localhost:14000}"
+SK_KEY="${LITELLM_API_KEY:-${VLLM_MANAGER_SK_KEY:-$(cat ~/.config/vllm-manager/litellm-key)}}"
 curl -sS "$LITELLM_URL/v1/chat/completions" \
   -H "Authorization: Bearer $SK_KEY" \
   -H "Content-Type: application/json" \
@@ -159,13 +183,14 @@ Names containing `rerank` that were saved as embedding are auto-migrated on back
 
 ## Agent checklist
 
-1. **401/403 on admin API** → obtain admin PAT first.
+1. **401/403 on admin API** → obtain admin PAT first (`token create`).
 2. Confirm `VLLM_MANAGER_URL` and token type (`vlmk_` vs `sk-`).
 3. **Ops** → admin PAT + `vllm-cli.sh` or `/api/*`.
-4. Pick **task_type**: chat / embedding / rerank (never start CrossEncoder via Manager).
-5. After start → `instances` + `smoke-test` before assuming ready.
-6. Inference: chat/embeddings via `:14000` with `sk-`, or backend `:18000/v1/*` path routing by subpath.
-7. Do not commit tokens.
+4. **Inference via `:14000`** → `inference-key ensure` (default models=`*` all; reuses existing).
+5. Pick **task_type**: chat / embedding / rerank (never start CrossEncoder via Manager).
+6. After start → `instances` + `smoke-test` before assuming ready.
+7. Inference: chat/embeddings via `:14000` with sk-, or backend `:18000/v1/*` path routing by subpath.
+8. Do not commit tokens (PAT file and litellm-key are separate).
 
 ## Defaults
 
@@ -174,6 +199,9 @@ Names containing `rerank` that were saved as embedding are auto-migrated on back
 | `VLLM_MANAGER_URL` | `http://localhost:18000` | Backend API |
 | `NEXT_PUBLIC_LITELLM_URL` / `LITELLM_URL` | `http://localhost:14000` | Inference gateway |
 | `VLLM_MANAGER_TOKEN` | `~/.config/vllm-manager/token` | PAT override |
+| `LITELLM_API_KEY` / `VLLM_MANAGER_SK_KEY` | `~/.config/vllm-manager/litellm-key` | Inference sk- |
+| `VLLM_MANAGER_INFERENCE_MODELS` | `*` | Default allow-list for `inference-key create` |
+| Skill `.env` | `skills/vllm-manager/.env` | Admin login + URL + models default |
 
 ## More detail
 

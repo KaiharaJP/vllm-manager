@@ -15,15 +15,30 @@ cp -r /path/to/vllm-manager/skills/vllm-manager ~/.cursor/skills/
 # or project-local under .cursor/skills/
 ```
 
-## Example 0: Admin PAT (required for start/download)
+## Example 0: Admin PAT + inference sk- (required setup)
+
+Uses [`skills/vllm-manager/.env`](.env) (`VLLM_MANAGER_ADMIN_USER` / `PASSWORD`, `VLLM_MANAGER_INFERENCE_MODELS=*`).
 
 ```bash
-$CLI token create --name automation --username admin --password '<admin-password>'
+$CLI token create --name automation                 # PAT — no model list
+$CLI inference-key ensure                           # sk- models=* get-or-create
+$CLI inference-key ensure                           # second call → reused: true
+# Restrict / refresh:
+# $CLI inference-key ensure --models 'vllm-local' --force
+$CLI inference-key show
 $CLI status
 $CLI instances
 ```
 
-**Still 403?** Token was issued by a non-admin user. Re-create with admin.
+PAT → `~/.config/vllm-manager/token`. Inference sk- → `~/.config/vllm-manager/litellm-key`.
+
+**Still 403 on start?** Non-admin credentials in skill `.env`, or pass `--username`/`--password`.
+
+Load sk- for curl:
+
+```bash
+SK="${LITELLM_API_KEY:-${VLLM_MANAGER_SK_KEY:-$(cat ~/.config/vllm-manager/litellm-key)}}"
+```
 
 ## Example 1: Chat LLM — start + smoke + inference
 
@@ -34,6 +49,7 @@ $CLI start "$MODEL" --context-length 32768 --no-download
 INSTANCE=$($CLI instances | jq -r '[.[] | select(.running==true)][0].instance_id')
 $CLI smoke-test "$INSTANCE"
 
+SK="${LITELLM_API_KEY:-${VLLM_MANAGER_SK_KEY:-$(cat ~/.config/vllm-manager/litellm-key)}}"
 curl -sS "$LITELLM_URL/v1/chat/completions" \
   -H "Authorization: Bearer $SK" \
   -H "Content-Type: application/json" \
@@ -56,9 +72,10 @@ curl -sS "$VLLM_MANAGER_URL/v1/embeddings" \
   -d "{\"model\":\"$EMB\",\"input\":\"対角化とは何か\"}" | jq '.data[0].embedding | length'
 ```
 
-Via LiteLLM (needs `sk-`):
+Via LiteLLM (needs sk- from Example 0):
 
 ```bash
+SK="${LITELLM_API_KEY:-${VLLM_MANAGER_SK_KEY:-$(cat ~/.config/vllm-manager/litellm-key)}}"
 curl -sS "$LITELLM_URL/v1/embeddings" \
   -H "Authorization: Bearer $SK" \
   -H "Content-Type: application/json" \

@@ -7,10 +7,15 @@ export interface ServerStatus {
   vllm_port: number;
   model: string | null;
   uptime_seconds: number;
+  instance_id?: string | null;
+  task_type?: "chat" | "embedding" | "rerank";
 }
 
 export interface RunningServer {
   pid: number;
+  instance_id?: string | null;
+  instance_name?: string | null;
+  task_type?: "chat" | "embedding" | "rerank";
   model: string | null;
   port: number | null;
   context_length: number | null;
@@ -40,9 +45,12 @@ export interface Model {
   gated?: boolean;
   trust_remote_code?: boolean;
   recommended_context_length?: number;
+  output_dimension?: number | null;
+  license_note?: string | null;
   required_gpu_memory_gb?: number | null;
   allowed_roles?: string[];
   source?: string;
+  task_type?: "chat" | "embedding" | "rerank";
   downloaded?: boolean;
   cache_path?: string | null;
   cache_size_bytes?: number;
@@ -74,6 +82,24 @@ export interface ServerConfig {
   limit_mm_per_prompt?: Record<string, number> | null;
   mm_encoder_tp_mode?: string;
   mm_processor_cache_type?: string;
+  task_type?: "chat" | "embedding" | "rerank";
+  trust_remote_code?: boolean;
+  instance_id?: string | null;
+  instance_name?: string | null;
+}
+
+export interface ServerInstance {
+  instance_id: string;
+  instance_name?: string | null;
+  task_type?: "chat" | "embedding" | "rerank";
+  running: boolean;
+  healthy: boolean;
+  pid: number | null;
+  vllm_port: number;
+  model: string | null;
+  uptime_seconds: number;
+  model_id?: string;
+  started_at?: number;
 }
 
 export interface ServerStartRequest {
@@ -97,12 +123,44 @@ export interface ServerStartRequest {
   limit_mm_per_prompt?: Record<string, number> | null;
   mm_encoder_tp_mode?: string;
   mm_processor_cache_type?: string;
+  task_type?: "chat" | "embedding" | "rerank";
+  trust_remote_code?: boolean;
+  instance_id?: string | null;
+  instance_name?: string | null;
+  create_new_instance?: boolean;
 }
 
 export interface ApiResponse {
   success: boolean;
   message: string;
   steps?: string[];
+  instance_id?: string;
+}
+
+export interface ApiToken {
+  id: string;
+  name: string;
+  username: string;
+  prefix: string;
+  created_at: number;
+  last_used_at: number | null;
+  expires_at: number | null;
+  disabled: boolean;
+}
+
+export interface ApiTokenCreated extends ApiToken {
+  token: string;
+}
+
+export interface SmokeTestResult {
+  instance_id: string;
+  success: boolean;
+  task_type: "chat" | "embedding" | "rerank" | null;
+  latency_ms: number | null;
+  tokens_generated: number | null;
+  tokens_per_sec: number | null;
+  response_preview: string | null;
+  error: string | null;
 }
 
 export interface MetricsData {
@@ -130,6 +188,8 @@ export interface AppUser {
   litellm_team_id?: string | null;
   disabled?: boolean;
   created_at?: number;
+  security_warnings?: string[];
+  must_change_password?: boolean;
 }
 
 export interface DownloadJob {
@@ -178,6 +238,24 @@ export interface LiteLLMProxyRequestRow {
 export interface ChatMessage {
   role?: string;
   content?: string | unknown;
+}
+
+export interface ChatUiMessage {
+  role: "user" | "assistant";
+  content: string;
+}
+
+export interface ChatModelsResponse {
+  models: string[];
+  count: number;
+}
+
+export interface ChatCompletionRequest {
+  model: string;
+  messages: ChatUiMessage[];
+  stream?: boolean;
+  temperature?: number;
+  max_tokens?: number;
 }
 
 export interface LiteLLMProxyRequestDetail extends LiteLLMProxyRequestRow {
@@ -286,6 +364,13 @@ export interface SystemMetrics {
     used_gb: number;
     total_gb: number;
   };
+  disks: Array<{
+    label: string;
+    path: string;
+    usage_percent: number;
+    used_gb: number;
+    total_gb: number;
+  }>;
   gpus: SystemGpuMetrics[];
   gpu_processes: GpuProcessMetrics[];
 }

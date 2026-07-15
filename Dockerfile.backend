@@ -26,7 +26,15 @@ RUN apt-get update \
     python3-dev \
     curl \
     build-essential \
+    gosu \
     && rm -rf /var/lib/apt/lists/*
+
+# 非root実行用ユーザー（root 実行はコンテナ侵害時の被害範囲を広げるため回避する）。
+# ホストのボリューム（vllm-data / hf-cache）の権限は docker-entrypoint.sh で調整する。
+ARG APP_UID=1000
+ARG APP_GID=1000
+RUN groupadd -g ${APP_GID} vllmapp \
+    && useradd -m -u ${APP_UID} -g ${APP_GID} -s /bin/bash vllmapp
 
 # Blackwell (SM120) 向け nvcc が compute_120f をサポートすることを build 時に検証
 RUN nvcc --version \
@@ -39,20 +47,29 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-RUN pip3 install --no-cache-dir vllm
+# バージョン未固定だと build のたびに最新 vLLM が入り、挙動が変わる（例: 0.24 で Blackwell FP8 が DeepGEMM で落ちる）。
+# 本環境では 0.21.0 で Qwen3.6-27B-FP8 等の稼働実績あり（docs/mtp-investigation-report.md）。
+RUN pip3 install --no-cache-dir "vllm==0.21.0"
 
 COPY app/ ./app/
 COPY config/ ./config/
+COPY tests/ ./tests/
+COPY scripts/ ./scripts/
+COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh /app/scripts/fix-hf-cache-permissions.sh
 
 RUN mkdir -p /app/data
 
-ENV HF_HOME=/root/.cache/huggingface
+ENV HF_HOME=/app/hf-cache
 ENV VLLM_MANAGER_DATA_DIR=/app/data
-RUN mkdir -p ${HF_HOME}
+RUN mkdir -p ${HF_HOME} ${HF_HOME}/.locks ${HF_HOME}/hub/.locks
 
 EXPOSE 8000 8001
 
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
     CMD curl -f http://localhost:8000/docs || exit 1
 
+# コンテナは root で起動し、entrypoint がボリューム権限を揃えたのち
+# 非root ユーザー（vllmapp）へ降格してアプリを実行する。
+ENTRYPOINT ["/usr/local/bin/docker-entrypoint.sh"]
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -21,3 +21,6 @@ frontend/out/
 .DS_Store
 .idea/
 .vscode/
+
+# バックアップ（機密データ含むためコミットしない）
+backups/

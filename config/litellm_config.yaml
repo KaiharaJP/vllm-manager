@@ -3,14 +3,19 @@
 #
 # モデル死活は推論プローブ（"test from litellm"）ではなく、
 # vllm-manager UI の「HTTP ヘルスチェック」または vLLM GET /health で確認する。
+#
+# 注意:
+# - chat/completions は本ファイルの openai/* ワイルドカードで backend へ転送する
+# - embeddings / score / rerank は litellm-gateway (nginx) が backend へ直パススルーする
+#   （LiteLLM の openai プロバイダは /v1/rerank 非対応のため）
+# - 固定モデル ID の列挙は不要。起動中インスタンスは Manager が振り分ける
 
 general_settings:
   health_check_skip_disabled_background_models: true
 
 model_list:
-  # 汎用ルーティング:
+  # 汎用ルーティング（chat）:
   # - モデル名を固定せず、backend(/v1/*) 側で起動中 vLLM へ動的にルーティングする
-  # - 具体的なモデルIDをここに書かなくても、起動済みモデルへ転送される
   - model_name: "vllm-local"
     model_info:
       mode: completion
@@ -25,7 +30,6 @@ model_list:
       extra_headers:
         X-Vllm-Manager-Source: litellm
   # Claude Code からの利用向けエイリアス
-  # - Claude Code の --model で指定しやすい名前を追加
   - model_name: "claude-vllm-local"
     model_info:
       mode: completion
@@ -38,7 +42,7 @@ model_list:
       pass_through_optional_params: true
       extra_headers:
         X-Vllm-Manager-Source: litellm
-  # 任意モデル名を受けるワイルドカード（実際の転送先は backend 側で解決）
+  # 任意モデル名を受けるワイルドカード（chat。embedding/rerank は gateway 経由）
   - model_name: "*"
     model_info:
       mode: completion

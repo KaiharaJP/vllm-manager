@@ -91,8 +91,7 @@ def _extract_request_meta(payload: Optional[dict[str, Any]]) -> dict[str, Any]:
     summary = f"{len(messages)} msg, ~{char_est} chars"
     if max_tokens_int is not None:
         summary += f", max_tokens={max_tokens_int}"
-    if preview:
-        summary += f' — "{preview}"'
+    # プレビュー本文は WebSocket 向け公開行には含めない（request_summary は件数のみ）
 
     messages_store, truncated = _store_messages(messages)
     return {
@@ -100,6 +99,7 @@ def _extract_request_meta(payload: Optional[dict[str, Any]]) -> dict[str, Any]:
         "message_count": len(messages),
         "prompt_char_est": char_est,
         "request_summary": summary,
+        "_preview": preview,
         "_messages": messages_store,
         "messages_truncated": truncated,
     }

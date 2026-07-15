@@ -1,8 +1,8 @@
 "use client";
 
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import type { AppUser, Model } from "@/types";
-import { ClipboardCopy, Info, Key, RefreshCw, Users } from "lucide-react";
+import type { AppUser, ApiToken, Model } from "@/types";
+import { ClipboardCopy, Info, Key, KeyRound, RefreshCw, Trash2, Users } from "lucide-react";
 import { api } from "@/lib/api";
 
 interface UserManagementPanelProps {
@@ -194,6 +194,129 @@ function ApiKeyModelSelector({
   );
 }
 
+function ApiTokenPanel({
+  tokens,
+  onRefresh,
+  onRevoke,
+  onCreate,
+  createBusy,
+  justCreatedToken,
+  message,
+}: {
+  tokens: ApiToken[];
+  onRefresh: () => void;
+  onRevoke: (tokenId: string) => void;
+  onCreate?: (name: string, expiresInDays: number | undefined) => void;
+  createBusy?: boolean;
+  justCreatedToken: string | null;
+  message: string | null;
+}) {
+  const [name, setName] = useState("");
+  const [expiresInDays, setExpiresInDays] = useState("");
+
+  return (
+    <div className="rounded-lg border border-white/10 bg-bg-tertiary/40 p-4 space-y-3">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2 text-xs text-gray-300">
+          <KeyRound className="w-3 h-3 text-accent-warning" />
+          <span>永続APIトークン（PAT）― サーバー操作・自動化用</span>
+        </div>
+        <button
+          onClick={onRefresh}
+          className="inline-flex items-center gap-1 rounded-md border border-white/10 px-2 py-1 text-[11px] text-gray-300 hover:bg-bg-primary"
+        >
+          <RefreshCw className="w-3 h-3" />
+          再読込
+        </button>
+      </div>
+      <p className="text-[11px] text-gray-500">
+        LiteLLM 推論用キー（sk-...）とは別物です。<code>vllm-cli.sh</code>
+        やスクリプトから、ログインなしでサーバー起動/停止・モデルダウンロードを自動化するためのトークンです。
+      </p>
+      {onCreate && (
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+          <label className="flex-1 block">
+            <span className="mb-1 block text-[11px] font-medium text-gray-400">名前</span>
+            <input
+              className="w-full bg-bg-tertiary border border-white/10 rounded-lg px-3 py-2 text-xs"
+              placeholder="例: cron-job"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+            />
+          </label>
+          <label className="w-32 block">
+            <span className="mb-1 block text-[11px] font-medium text-gray-400">有効日数（任意）</span>
+            <input
+              className="w-full bg-bg-tertiary border border-white/10 rounded-lg px-3 py-2 text-xs"
+              placeholder="無期限"
+              value={expiresInDays}
+              onChange={(e) => setExpiresInDays(e.target.value)}
+            />
+          </label>
+          <button
+            disabled={!name.trim() || createBusy}
+            onClick={() => {
+              onCreate(name.trim(), expiresInDays ? Number(expiresInDays) : undefined);
+              setName("");
+              setExpiresInDays("");
+            }}
+            className="shrink-0 inline-flex items-center gap-1 rounded-md bg-accent-primary px-3 py-2 text-[11px] text-white disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <KeyRound className="w-3 h-3" />
+            発行
+          </button>
+        </div>
+      )}
+      {justCreatedToken && (
+        <div className="rounded-lg border border-accent-warning/40 bg-accent-warning/10 p-3 text-xs text-accent-warning space-y-1">
+          <p className="font-medium">この画面でしか表示されません。今すぐコピーしてください。</p>
+          <code className="block break-all text-[11px] text-gray-100">{justCreatedToken}</code>
+        </div>
+      )}
+      {message && <p className="text-[11px] text-gray-400 whitespace-pre-wrap">{message}</p>}
+      <div className="space-y-2">
+        {tokens.length > 0 ? (
+          tokens.map((token) => (
+            <div key={token.id} className="rounded-lg border border-white/10 bg-bg-primary/70 p-3 text-xs">
+              <div className="flex items-start justify-between gap-3">
+                <div className="min-w-0 flex-1 space-y-1">
+                  <p className="font-medium text-gray-100">
+                    {token.name}
+                    {token.disabled && <span className="ml-2 text-[10px] text-accent-danger">失効済み</span>}
+                  </p>
+                  <p className="text-gray-500 font-mono">{token.prefix}...</p>
+                  <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-gray-400">
+                    <span>作成: {new Date(token.created_at * 1000).toLocaleString()}</span>
+                    <span>
+                      最終使用:{" "}
+                      {token.last_used_at ? new Date(token.last_used_at * 1000).toLocaleString() : "未使用"}
+                    </span>
+                    <span>
+                      有効期限:{" "}
+                      {token.expires_at ? new Date(token.expires_at * 1000).toLocaleString() : "無期限"}
+                    </span>
+                  </div>
+                </div>
+                {!token.disabled && (
+                  <button
+                    onClick={() => onRevoke(token.id)}
+                    className="shrink-0 inline-flex items-center gap-1 rounded-md border border-red-500/40 bg-red-500/10 px-2 py-1 text-[11px] text-red-300 hover:bg-red-500/20"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                    失効
+                  </button>
+                )}
+              </div>
+            </div>
+          ))
+        ) : (
+          <p className="text-gray-500 text-xs">まだ発行済みのトークンはありません。</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function copyTextWithFallback(text: string): boolean {
   try {
     const textarea = document.createElement("textarea");
@@ -244,6 +367,12 @@ export default function UserManagementPanel({ currentUser }: UserManagementPanel
   });
   const [copiedKeySig, setCopiedKeySig] = useState<string | null>(null);
   const [issuedSecretsByToken, setIssuedSecretsByToken] = useState<Record<string, string>>({});
+  const [myTokens, setMyTokens] = useState<ApiToken[]>([]);
+  const [myTokenMessage, setMyTokenMessage] = useState<string | null>(null);
+  const [myTokenCreating, setMyTokenCreating] = useState(false);
+  const [justCreatedMyToken, setJustCreatedMyToken] = useState<string | null>(null);
+  const [selectedUserTokens, setSelectedUserTokens] = useState<ApiToken[]>([]);
+  const [selectedUserTokenMessage, setSelectedUserTokenMessage] = useState<string | null>(null);
 
   type KeyInfo = {
     key_name?: string | null;
@@ -290,6 +419,7 @@ export default function UserManagementPanel({ currentUser }: UserManagementPanel
       newPassword: "",
     });
     refreshMyKeys();
+    refreshMyTokens();
   }, []);
 
   async function refreshUsers() {
@@ -313,6 +443,62 @@ export default function UserManagementPanel({ currentUser }: UserManagementPanel
       setLiteKeys(result.keys);
     } catch (err) {
       setApiMessage(String(err));
+    }
+  }
+
+  async function refreshMyTokens() {
+    try {
+      const result = await api.getMyTokens();
+      setMyTokens(result.tokens);
+    } catch (err) {
+      setMyTokenMessage(String(err));
+    }
+  }
+
+  async function createMyToken(name: string, expiresInDays: number | undefined) {
+    setMyTokenCreating(true);
+    setMyTokenMessage(null);
+    try {
+      const created = await api.createMyToken({ name, expires_in_days: expiresInDays });
+      setJustCreatedMyToken(created.token);
+      await refreshMyTokens();
+    } catch (err) {
+      setMyTokenMessage(String(err));
+    } finally {
+      setMyTokenCreating(false);
+    }
+  }
+
+  async function revokeMyToken(tokenId: string) {
+    setMyTokenMessage(null);
+    try {
+      await api.revokeMyToken(tokenId);
+      setMyTokenMessage("トークンを失効させました。");
+      await refreshMyTokens();
+    } catch (err) {
+      setMyTokenMessage(String(err));
+    }
+  }
+
+  async function refreshSelectedUserTokens() {
+    if (!selectedUser) return;
+    try {
+      const result = await api.getUserTokens(selectedUser.username);
+      setSelectedUserTokens(result.tokens);
+    } catch (err) {
+      setSelectedUserTokenMessage(String(err));
+    }
+  }
+
+  async function revokeSelectedUserToken(tokenId: string) {
+    if (!selectedUser) return;
+    setSelectedUserTokenMessage(null);
+    try {
+      await api.revokeUserToken(selectedUser.username, tokenId);
+      setSelectedUserTokenMessage("トークンを強制失効させました。");
+      await refreshSelectedUserTokens();
+    } catch (err) {
+      setSelectedUserTokenMessage(String(err));
     }
   }
 
@@ -383,6 +569,7 @@ export default function UserManagementPanel({ currentUser }: UserManagementPanel
   useEffect(() => {
     if (selectedUser) {
       refreshLiteKeys();
+      refreshSelectedUserTokens();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedUser?.username]);
@@ -748,6 +935,18 @@ export default function UserManagementPanel({ currentUser }: UserManagementPanel
             )}
           </div>
         </div>
+
+        <div className="bg-bg-secondary rounded-xl border border-white/5 p-6">
+          <ApiTokenPanel
+            tokens={myTokens}
+            onRefresh={refreshMyTokens}
+            onRevoke={revokeMyToken}
+            onCreate={createMyToken}
+            createBusy={myTokenCreating}
+            justCreatedToken={justCreatedMyToken}
+            message={myTokenMessage}
+          />
+        </div>
       </div>
     );
   }
@@ -1068,6 +1267,19 @@ export default function UserManagementPanel({ currentUser }: UserManagementPanel
                     </p>
                   )}
                 </div>
+              </div>
+
+              <div className="mt-4 border-t border-white/10 pt-3">
+                <ApiTokenPanel
+                  tokens={selectedUserTokens}
+                  onRefresh={refreshSelectedUserTokens}
+                  onRevoke={revokeSelectedUserToken}
+                  justCreatedToken={null}
+                  message={selectedUserTokenMessage}
+                />
+                <p className="mt-2 text-[11px] text-gray-500">
+                  管理者はこのユーザーの永続APIトークンを閲覧・強制失効できますが、代理発行はできません（発行はユーザー本人がマイページから行います）。
+                </p>
               </div>
             </div>
           )}

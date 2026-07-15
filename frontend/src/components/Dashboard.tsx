@@ -12,6 +12,7 @@ import LiteLLMAdminPanel from "@/components/LiteLLMAdminPanel";
 import UserManagementPanel from "@/components/UserManagementPanel";
 import UsagePanel from "@/components/UsagePanel";
 import SystemOverview from "@/components/SystemOverview";
+import ChatPanel from "@/components/ChatPanel";
 import { api } from "@/lib/api";
 import type { AppUser, DownloadJob, ServerStatus, Model, ServerConfig, ContextPreset } from "@/types";
 
@@ -20,7 +21,7 @@ interface DashboardProps {
   onLogout: () => void;
 }
 
-type TabKey = "overview" | "control" | "metrics" | "requestHistory" | "models" | "users" | "litellm" | "usage" | "config" | "log";
+type TabKey = "overview" | "chat" | "control" | "metrics" | "requestHistory" | "models" | "users" | "litellm" | "usage" | "config" | "log";
 const TAB_STORAGE_KEY = "vllm_manager_active_tab";
 
 export default function Dashboard({ currentUser, onLogout }: DashboardProps) {
@@ -29,7 +30,8 @@ export default function Dashboard({ currentUser, onLogout }: DashboardProps) {
   const [models, setModels] = useState<Model[]>([]);
   const [jobs, setJobs] = useState<DownloadJob[]>([]);
   const [contextPresets, setContextPresets] = useState<ContextPreset[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [statusLoading, setStatusLoading] = useState(true);
+  const [secondaryLoading, setSecondaryLoading] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<TabKey>("overview");
 
@@ -37,8 +39,8 @@ export default function Dashboard({ currentUser, onLogout }: DashboardProps) {
     const saved = window.localStorage.getItem(TAB_STORAGE_KEY) as TabKey | null;
     if (!saved) return;
     const allowedTabs: TabKey[] = currentUser.role === "admin"
-      ? ["overview", "control", "metrics", "requestHistory", "models", "users", "litellm", "usage", "config", "log"]
-      : ["overview", "metrics", "users"];
+      ? ["overview", "chat", "control", "metrics", "requestHistory", "models", "users", "litellm", "usage", "config", "log"]
+      : ["overview", "chat", "metrics", "users"];
     setActiveTab(allowedTabs.includes(saved) ? saved : "overview");
   }, [currentUser.role]);
 
@@ -47,7 +49,7 @@ export default function Dashboard({ currentUser, onLogout }: DashboardProps) {
   }, [activeTab]);
 
   useEffect(() => {
-    loadInitialData();
+    void loadInitialData();
     const statusInterval = setInterval(refreshStatus, 10000);
     const jobsInterval =
       currentUser.role === "admin" ? setInterval(refreshModels, 5000) : null;
@@ -55,44 +57,44 @@ export default function Dashboard({ currentUser, onLogout }: DashboardProps) {
       clearInterval(statusInterval);
       if (jobsInterval) clearInterval(jobsInterval);
     };
-  }, []);
+  }, [currentUser.role]);
 
-  /** API が返らない場合でも画面を永久ブロックしない */
-  useEffect(() => {
-    if (!loading) return;
-    const t = window.setTimeout(() => setLoading(false), 32_000);
-    return () => window.clearTimeout(t);
-  }, [loading]);
-
-  async function loadInitialData() {
+  async function loadSecondaryData() {
+    setSecondaryLoading(true);
     try {
-      setLoadError(null);
-      const loadAll = Promise.all([
-        api.getStatus(),
+      const results = await Promise.allSettled([
         api.getConfig(),
         api.getModels(),
         api.getContextPresets(),
         currentUser.role === "admin" ? api.getModelDownloads() : Promise.resolve([]),
       ]);
-      const loadWithDeadline = Promise.race([
-        loadAll,
-        new Promise<never>((_, reject) => {
-          window.setTimeout(() => {
-            reject(new Error("初期データ取得がタイムアウトしました（12秒）"));
-          }, 12_000);
-        }),
-      ]);
-      const [statusData, configData, modelsData, presetsData, jobsData] = await loadWithDeadline;
+      const [configResult, modelsResult, presetsResult, jobsResult] = results;
+      if (configResult.status === "fulfilled") setConfig(configResult.value);
+      if (modelsResult.status === "fulfilled") setModels(modelsResult.value);
+      if (presetsResult.status === "fulfilled") setContextPresets(presetsResult.value);
+      if (jobsResult.status === "fulfilled") setJobs(jobsResult.value);
+      const failed = results.find((r) => r.status === "rejected");
+      if (failed?.status === "rejected") {
+        const reason = failed.reason;
+        setLoadError(reason instanceof Error ? reason.message : String(reason));
+      }
+    } finally {
+      setSecondaryLoading(false);
+    }
+  }
+
+  async function loadInitialData() {
+    setStatusLoading(true);
+    void loadSecondaryData();
+    try {
+      setLoadError(null);
+      const statusData = await api.getStatus();
       setStatus(statusData);
-      setConfig(configData);
-      setModels(modelsData);
-      setContextPresets(presetsData);
-      setJobs(jobsData);
     } catch (err) {
-      console.error("Failed to load initial data:", err);
+      console.error("Failed to load status:", err);
       setLoadError(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
+      setStatusLoading(false);
     }
   }
 
@@ -118,25 +120,26 @@ export default function Dashboard({ currentUser, onLogout }: DashboardProps) {
     }
   }
 
-  if (loading) {
-    return (
-      <div className="flex items-center justify-center min-h-screen">
-        <div className="text-center">
-          <div className="w-12 h-12 border-4 border-accent-primary border-t-transparent rounded-full animate-spin mx-auto mb-4" />
-          <p className="text-gray-400">Loading...</p>
-        </div>
-      </div>
-    );
-  }
-
   return (
     <div className="min-h-screen bg-bg-primary">
       <Header status={status} user={currentUser} onLogout={onLogout} />
 
+      {statusLoading && (
+        <div className="bg-bg-secondary/80 border-b border-white/5 px-4 py-2 text-xs text-gray-500">
+          サーバー状態を読み込み中...
+        </div>
+      )}
+
       {loadError && (
         <div className="bg-accent-danger/15 border-b border-accent-danger/40 px-4 py-3 text-sm text-red-200">
-          <p className="font-medium">初期データの取得に失敗しました</p>
+          <p className="font-medium">データの取得に失敗しました</p>
           <p className="text-red-300/90 mt-1">{loadError}</p>
+        </div>
+      )}
+
+      {secondaryLoading && (
+        <div className="bg-bg-secondary/80 border-b border-white/5 px-4 py-2 text-xs text-gray-500">
+          モデル一覧などの追加データを読み込み中...
         </div>
       )}
 
@@ -146,6 +149,7 @@ export default function Dashboard({ currentUser, onLogout }: DashboardProps) {
           <div className="flex gap-1">
             {([
               { key: "overview", label: "ホーム" },
+              { key: "chat", label: "チャット" },
               ...(currentUser.role === "admin" ? [
                 { key: "control", label: "サーバー管理" },
               ] as const : []),
@@ -184,6 +188,7 @@ export default function Dashboard({ currentUser, onLogout }: DashboardProps) {
       {/* コンテンツ */}
       <main className="max-w-7xl mx-auto px-4 py-6">
         {activeTab === "overview" && <SystemOverview />}
+        {activeTab === "chat" && <ChatPanel />}
         {activeTab === "control" && currentUser.role === "admin" && (
           <ServerControl
             status={status}

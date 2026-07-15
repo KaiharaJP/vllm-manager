@@ -5,11 +5,13 @@ vLLM サーバーの起動/停止/ステータス管理を担う。
 Docker 環境内で動作することを前提としている。
 """
 
+import re
 import subprocess
 import time
 import os
 import signal
 import json
+import uuid
 from pathlib import Path
 from typing import Any, Optional
 from huggingface_hub import snapshot_download
@@ -19,6 +21,11 @@ DATA_DIR = Path(os.environ.get("VLLM_MANAGER_DATA_DIR", "/tmp/vllm-manager-data"
 PID_FILE = DATA_DIR / "vllm.pid"
 LOG_FILE = DATA_DIR / "vllm.log"
 CONFIG_FILE = DATA_DIR / "config.json"
+INSTANCES_DIR = DATA_DIR / "instances"
+INSTANCES_REGISTRY_FILE = DATA_DIR / "instances.json"
+DEFAULT_INSTANCE_ID = "default"
+VALID_TASK_TYPES = frozenset({"chat", "embedding", "rerank"})
+POOLING_TASK_TYPES = frozenset({"embedding", "rerank"})
 
 # --- デフォルトモデルリスト ---
 DEFAULT_MODELS = [
@@ -30,6 +37,7 @@ DEFAULT_MODELS = [
     {"id": "microsoft/Phi-3-mini-4k-instruct", "name": "Phi-3 Mini 4K Instruct", "size": "3.8B"},
     {"id": "google/gemma-2-27b-it", "name": "Gemma 2 27B IT", "size": "27B"},
     {"id": "google/gemma-2-9b-it", "name": "Gemma 2 9B IT", "size": "9B"},
+    {"id": "jinaai/jina-embeddings-v3", "name": "Jina Embeddings v3", "size": "embed", "task_type": "embedding", "recommended_context_length": 8192},
 ]
 
 # --- コンテキスト長のプリセット ---
@@ -157,12 +165,38 @@ def _normalize_speculative_config(value: Any) -> Optional[dict[str, Any]]:
 
 def ensure_data_dir():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    INSTANCES_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def load_config() -> dict:
-    """保存済み設定を読み込む。"""
-    ensure_data_dir()
-    defaults = {
+def _normalize_task_type(value: Any) -> str:
+    task = str(value or "chat").strip().lower()
+    return task if task in VALID_TASK_TYPES else "chat"
+
+
+def _sanitize_instance_id(value: str) -> str:
+    text = re.sub(r"[^a-zA-Z0-9._-]+", "-", (value or "").strip()).strip("-")
+    return text[:64] if text else ""
+
+
+def _instance_paths(instance_id: str) -> dict[str, Path]:
+    if instance_id == DEFAULT_INSTANCE_ID:
+        return {
+            "dir": DATA_DIR,
+            "pid": PID_FILE,
+            "log": LOG_FILE,
+            "config": CONFIG_FILE,
+        }
+    base = INSTANCES_DIR / instance_id
+    return {
+        "dir": base,
+        "pid": base / "vllm.pid",
+        "log": base / "vllm.log",
+        "config": base / "config.json",
+    }
+
+
+def _default_config_template() -> dict[str, Any]:
+    return {
         "model_id": DEFAULT_MODELS[0]["id"],
         "context_length": 131072,
         "max_num_seqs": 6,
@@ -183,76 +217,169 @@ def load_config() -> dict:
         "limit_mm_per_prompt": None,
         "mm_encoder_tp_mode": "",
         "mm_processor_cache_type": "",
+        "task_type": "chat",
+        "instance_id": DEFAULT_INSTANCE_ID,
+        "instance_name": "default",
+        "trust_remote_code": False,
     }
-    if CONFIG_FILE.exists():
+
+
+def _normalize_config_payload(config: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(config)
+    payload["max_num_seqs"] = max(1, min(MAX_NUM_SEQS_LIMIT, int(payload.get("max_num_seqs", 1))))
+    _clamp_default_sampling_params(payload)
+    payload["context_length"] = max(1024, min(262144, int(payload.get("context_length", 8192))))
+    payload["gpu_memory_mode"] = (
+        "manual" if str(payload.get("gpu_memory_mode", "auto")).lower() == "manual" else "auto"
+    )
+    payload["gpu_memory_utilization"] = max(
+        0.1, min(GPU_MEMORY_UTILIZATION_SAFE_MAX, float(payload.get("gpu_memory_utilization", 0.85)))
+    )
+    payload["speculative_config"] = _normalize_speculative_config(payload.get("speculative_config"))
+    payload["enable_auto_tool_choice"] = bool(payload.get("enable_auto_tool_choice", False))
+    payload["tool_call_parser"] = _normalize_tool_call_parser(payload.get("tool_call_parser"))
+    payload["limit_mm_per_prompt"] = _normalize_limit_mm_per_prompt(payload.get("limit_mm_per_prompt"))
+    payload["mm_encoder_tp_mode"] = str(payload.get("mm_encoder_tp_mode") or "").strip()
+    payload["mm_processor_cache_type"] = str(payload.get("mm_processor_cache_type") or "").strip()
+    payload["task_type"] = _normalize_task_type(payload.get("task_type"))
+    payload["trust_remote_code"] = bool(payload.get("trust_remote_code", False))
+    return payload
+
+
+def load_config(instance_id: Optional[str] = None) -> dict:
+    """保存済み設定を読み込む。instance_id 未指定時は UI テンプレート（default）。"""
+    ensure_data_dir()
+    target_id = instance_id or DEFAULT_INSTANCE_ID
+    paths = _instance_paths(target_id)
+    defaults = _default_config_template()
+    defaults["instance_id"] = target_id
+    if paths["config"].exists():
         try:
-            saved = json.loads(CONFIG_FILE.read_text())
+            saved = json.loads(paths["config"].read_text())
             defaults.update(saved)
-            # keep legacy configs compatible while enforcing current UI/API limits
-            defaults["max_num_seqs"] = max(1, min(MAX_NUM_SEQS_LIMIT, int(defaults.get("max_num_seqs", 1))))
-            _clamp_default_sampling_params(defaults)
-            defaults["context_length"] = max(1024, min(262144, int(defaults.get("context_length", 8192))))
-            defaults["gpu_memory_mode"] = (
-                "manual" if str(defaults.get("gpu_memory_mode", "auto")).lower() == "manual" else "auto"
-            )
-            defaults["gpu_memory_utilization"] = max(
-                0.1, min(GPU_MEMORY_UTILIZATION_SAFE_MAX, float(defaults.get("gpu_memory_utilization", 0.85)))
-            )
-            defaults["speculative_config"] = _normalize_speculative_config(
-                defaults.get("speculative_config")
-            )
-            defaults["enable_auto_tool_choice"] = bool(defaults.get("enable_auto_tool_choice", False))
-            defaults["tool_call_parser"] = _normalize_tool_call_parser(defaults.get("tool_call_parser"))
-            defaults["limit_mm_per_prompt"] = _normalize_limit_mm_per_prompt(
-                defaults.get("limit_mm_per_prompt")
-            )
-            defaults["mm_encoder_tp_mode"] = str(defaults.get("mm_encoder_tp_mode") or "").strip()
-            defaults["mm_processor_cache_type"] = str(
-                defaults.get("mm_processor_cache_type") or ""
-            ).strip()
-            return defaults
+            normalized = _normalize_config_payload(defaults)
+            normalized["instance_id"] = target_id
+            return normalized
         except (json.JSONDecodeError, IOError):
             pass
-    return defaults
+    return _normalize_config_payload(defaults)
 
 
-def save_config(config: dict) -> None:
-    """設定を保存する。"""
+def save_config(config: dict, instance_id: Optional[str] = None) -> None:
+    """設定を保存する。instance_id 未指定時は UI テンプレート（default）。"""
     ensure_data_dir()
-    payload = dict(config)
-    if "speculative_config" in payload:
-        payload["speculative_config"] = _normalize_speculative_config(payload.get("speculative_config"))
-    CONFIG_FILE.write_text(json.dumps(payload, indent=2))
+    target_id = instance_id or str(config.get("instance_id") or DEFAULT_INSTANCE_ID)
+    paths = _instance_paths(target_id)
+    if target_id != DEFAULT_INSTANCE_ID:
+        paths["dir"].mkdir(parents=True, exist_ok=True)
+    payload = _normalize_config_payload(dict(config))
+    payload["instance_id"] = target_id
+    paths["config"].write_text(json.dumps(payload, indent=2, ensure_ascii=False))
 
 
-def get_status() -> dict:
-    """vLLM サーバーの状態を確認する。"""
-    status = {
+def _load_instances_registry() -> list[dict[str, Any]]:
+    ensure_data_dir()
+    if not INSTANCES_REGISTRY_FILE.exists():
+        return []
+    try:
+        data = json.loads(INSTANCES_REGISTRY_FILE.read_text())
+    except (json.JSONDecodeError, IOError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [item for item in data if isinstance(item, dict) and item.get("instance_id")]
+
+
+def _save_instances_registry(entries: list[dict[str, Any]]) -> None:
+    ensure_data_dir()
+    INSTANCES_REGISTRY_FILE.write_text(json.dumps(entries, indent=2, ensure_ascii=False))
+
+
+def _upsert_instance_registry(entry: dict[str, Any]) -> None:
+    entries = _load_instances_registry()
+    instance_id = str(entry.get("instance_id") or "")
+    if not instance_id:
+        return
+    kept = [item for item in entries if item.get("instance_id") != instance_id]
+    kept.append(entry)
+    _save_instances_registry(kept)
+
+
+def _remove_instance_registry(instance_id: str) -> None:
+    kept = [item for item in _load_instances_registry() if item.get("instance_id") != instance_id]
+    _save_instances_registry(kept)
+
+
+def _registry_entry_for(instance_id: str) -> Optional[dict[str, Any]]:
+    for item in _load_instances_registry():
+        if item.get("instance_id") == instance_id:
+            return item
+    return None
+
+
+def _resolve_new_instance_id(
+    *,
+    instance_id: Optional[str],
+    instance_name: Optional[str],
+    model_id: str,
+) -> str:
+    if instance_id:
+        sanitized = _sanitize_instance_id(instance_id)
+        if sanitized:
+            return sanitized
+    if instance_name:
+        sanitized = _sanitize_instance_id(instance_name)
+        if sanitized:
+            return sanitized
+    leaf = _sanitize_instance_id(model_id.split("/")[-1]) or "model"
+    return f"inst-{leaf}-{uuid.uuid4().hex[:6]}"
+
+
+def _choose_instance_id_for_legacy_start() -> str:
+    default_status = get_instance_status(DEFAULT_INSTANCE_ID)
+    if not default_status.get("running"):
+        return DEFAULT_INSTANCE_ID
+    return _resolve_new_instance_id(instance_id=None, instance_name=None, model_id="vllm")
+
+
+def get_instance_status(instance_id: str) -> dict[str, Any]:
+    """指定インスタンスの vLLM 状態を確認する。"""
+    paths = _instance_paths(instance_id)
+    status: dict[str, Any] = {
+        "instance_id": instance_id,
+        "instance_name": (_registry_entry_for(instance_id) or {}).get("instance_name"),
+        "task_type": load_config(instance_id).get("task_type", "chat"),
         "running": False,
         "healthy": False,
         "pid": None,
-        "vllm_port": 8001,
-        "model": None,
+        "vllm_port": load_config(instance_id).get("vllm_port", 8001),
+        "model": load_config(instance_id).get("model_id"),
         "uptime_seconds": 0,
     }
+    registry = _registry_entry_for(instance_id)
+    if registry:
+        status["instance_name"] = registry.get("instance_name") or status["instance_name"]
+        status["task_type"] = registry.get("task_type") or status["task_type"]
 
-    if not PID_FILE.exists():
+    if not paths["pid"].exists():
         return status
 
     try:
-        pid = int(PID_FILE.read_text().strip())
+        pid = int(paths["pid"].read_text().strip())
         status["pid"] = pid
-        status["vllm_port"] = load_config().get("vllm_port", 8001)
+        cfg = load_config(instance_id)
+        status["vllm_port"] = cfg.get("vllm_port", 8001)
+        status["model"] = cfg.get("model_id")
+        status["task_type"] = cfg.get("task_type", status["task_type"])
 
         if not _process_exists(pid):
-            PID_FILE.unlink(missing_ok=True)
+            paths["pid"].unlink(missing_ok=True)
             return status
 
         status["running"] = True
-
-        # ヘルスチェック
         try:
             import httpx
+
             resp = httpx.get(
                 f"http://localhost:{status['vllm_port']}/health",
                 timeout=3.0,
@@ -261,22 +388,197 @@ def get_status() -> dict:
                 status["healthy"] = True
                 try:
                     health_data = resp.json()
-                    status["model"] = health_data.get("model")
+                    status["model"] = health_data.get("model") or status["model"]
                 except Exception:
-                    status["model"] = load_config().get("model_id")
+                    pass
             try:
                 import psutil
+
                 proc = psutil.Process(pid)
                 status["uptime_seconds"] = time.time() - proc.create_time()
             except Exception:
                 pass
         except Exception:
             pass
-
     except (ValueError, IOError):
-        PID_FILE.unlink(missing_ok=True)
+        paths["pid"].unlink(missing_ok=True)
 
     return status
+
+
+def list_instances() -> list[dict[str, Any]]:
+    """管理対象インスタンス一覧（実行中/停止済みレジストリ含む）。"""
+    seen: set[str] = set()
+    items: list[dict[str, Any]] = []
+
+    for entry in _load_instances_registry():
+        instance_id = str(entry.get("instance_id") or "")
+        if not instance_id or instance_id in seen:
+            continue
+        seen.add(instance_id)
+        status = get_instance_status(instance_id)
+        items.append({**entry, **status})
+
+    for server in list_running_servers():
+        if not server.get("managed_by_app"):
+            continue
+        instance_id = server.get("instance_id")
+        if not instance_id or instance_id in seen:
+            continue
+        seen.add(instance_id)
+        status = get_instance_status(str(instance_id))
+        items.append(
+            {
+                "instance_id": instance_id,
+                "instance_name": server.get("instance_name"),
+                "task_type": server.get("task_type") or "chat",
+                **status,
+            }
+        )
+
+    if DEFAULT_INSTANCE_ID not in seen:
+        default_status = get_instance_status(DEFAULT_INSTANCE_ID)
+        if default_status.get("running") or _registry_entry_for(DEFAULT_INSTANCE_ID):
+            items.insert(0, {**(_registry_entry_for(DEFAULT_INSTANCE_ID) or {}), **default_status})
+
+    items.sort(key=lambda item: (not item.get("running"), str(item.get("instance_id") or "")))
+    return items
+
+
+def get_status() -> dict:
+    """後方互換: default インスタンスの状態。稼働中の managed があれば最初の1件も返す。"""
+    default = get_instance_status(DEFAULT_INSTANCE_ID)
+    if default.get("running"):
+        return default
+    managed = [item for item in list_instances() if item.get("running")]
+    if managed:
+        primary = managed[0]
+        return {
+            "running": primary.get("running", False),
+            "healthy": primary.get("healthy", False),
+            "pid": primary.get("pid"),
+            "vllm_port": primary.get("vllm_port", 8001),
+            "model": primary.get("model"),
+            "uptime_seconds": primary.get("uptime_seconds", 0),
+            "instance_id": primary.get("instance_id"),
+            "task_type": primary.get("task_type"),
+        }
+    return default
+
+
+SMOKE_TEST_PROMPT = "こんにちは。1+1は何ですか？数字だけで答えてください。"
+SMOKE_TEST_MAX_TOKENS = 16
+SMOKE_TEST_TIMEOUT_SEC = 30.0
+
+
+async def run_smoke_test(instance_id: str) -> dict[str, Any]:
+    """稼働中インスタンスへ実際に最小リクエストを送り、疎通と生成品質を検証する。
+
+    起動 API のヘルスチェック（`/health` の 200 応答）は「プロセスが立って
+    いるか」しか分からないため、実際に `/v1/chat/completions`（または
+    embedding タスクなら `/v1/embeddings`）へ最小リクエストを送って応答を
+    確認する。
+    """
+    import httpx
+
+    result: dict[str, Any] = {
+        "instance_id": instance_id,
+        "success": False,
+        "task_type": None,
+        "latency_ms": None,
+        "tokens_generated": None,
+        "tokens_per_sec": None,
+        "response_preview": None,
+        "error": None,
+    }
+
+    status = get_instance_status(instance_id)
+    if not status.get("running"):
+        result["error"] = f"インスタンス {instance_id} は起動していません"
+        return result
+    if not status.get("healthy"):
+        result["error"] = f"インスタンス {instance_id} はヘルスチェック未通過のため疎通テストをスキップしました"
+        return result
+
+    task_type = status.get("task_type") or "chat"
+    port = status.get("vllm_port", 8001)
+    model = status.get("model") or "unknown"
+    result["task_type"] = task_type
+
+    started = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=SMOKE_TEST_TIMEOUT_SEC) as client:
+            if task_type == "embedding":
+                resp = await client.post(
+                    f"http://localhost:{port}/v1/embeddings",
+                    json={"model": model, "input": SMOKE_TEST_PROMPT},
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                embedding = ((data.get("data") or [{}])[0]).get("embedding") or []
+                result["response_preview"] = f"embedding dim={len(embedding)}"
+                result["tokens_generated"] = (data.get("usage") or {}).get("total_tokens")
+            elif task_type == "rerank":
+                score_payload = {
+                    "model": model,
+                    "text_1": SMOKE_TEST_PROMPT,
+                    "text_2": "smoke test document",
+                }
+                resp = None
+                last_error: Exception | None = None
+                for path in ("/v1/score", "/score", "/v1/rerank", "/rerank"):
+                    try:
+                        if path.endswith("rerank"):
+                            payload = {
+                                "model": model,
+                                "query": SMOKE_TEST_PROMPT,
+                                "documents": ["smoke test document"],
+                            }
+                        else:
+                            payload = score_payload
+                        resp = await client.post(f"http://localhost:{port}{path}", json=payload)
+                        resp.raise_for_status()
+                        break
+                    except Exception as exc:  # pragma: no cover - try next endpoint
+                        last_error = exc
+                        resp = None
+                if resp is None:
+                    raise RuntimeError(f"rerank smoke endpoints failed: {last_error}")
+                data = resp.json()
+                preview = str(data)[:200]
+                if isinstance(data, dict):
+                    results = data.get("results") or data.get("data") or data.get("scores")
+                    if results is not None:
+                        preview = f"rerank results={len(results) if hasattr(results, '__len__') else results}"
+                result["response_preview"] = preview
+            else:
+                resp = await client.post(
+                    f"http://localhost:{port}/v1/chat/completions",
+                    json={
+                        "model": model,
+                        "messages": [{"role": "user", "content": SMOKE_TEST_PROMPT}],
+                        "max_tokens": SMOKE_TEST_MAX_TOKENS,
+                        "temperature": 0,
+                        "stream": False,
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                choice = (data.get("choices") or [{}])[0]
+                content = ((choice.get("message") or {}).get("content") or "").strip()
+                result["response_preview"] = content[:200]
+                result["tokens_generated"] = (data.get("usage") or {}).get("completion_tokens")
+
+        elapsed = time.monotonic() - started
+        result["latency_ms"] = round(elapsed * 1000, 1)
+        if result["tokens_generated"] and elapsed > 0:
+            result["tokens_per_sec"] = round(result["tokens_generated"] / elapsed, 2)
+        result["success"] = True
+    except Exception as exc:
+        result["latency_ms"] = round((time.monotonic() - started) * 1000, 1)
+        result["error"] = f"疎通テスト失敗: {exc}"
+
+    return result
 
 
 def _process_exists(pid: int) -> bool:
@@ -322,16 +624,25 @@ def _used_vllm_ports() -> set[int]:
 
 def _build_command(config: dict) -> list:
     """vLLM 起動コマンドを構築する。"""
+    task_type = _normalize_task_type(config.get("task_type"))
     launch_model = _resolve_launch_model(config["model_id"], config.get("revision"))
     cmd = [
         "vllm", "serve", launch_model,
         "--host", "0.0.0.0",
         "--port", str(config["vllm_port"]),
         "--max-model-len", str(config["context_length"]),
-        "--max-num-seqs", str(config["max_num_seqs"]),
         "--gpu-memory-utilization", str(config["gpu_memory_utilization"]),
         "--tensor-parallel-size", str(config["tensor_parallel_size"]),
     ]
+    if task_type in POOLING_TASK_TYPES:
+        cmd.extend(["--runner", "pooling"])
+    else:
+        cmd.extend(["--max-num-seqs", str(config["max_num_seqs"])])
+    if config.get("trust_remote_code"):
+        cmd.append("--trust-remote-code")
+    if task_type in POOLING_TASK_TYPES:
+        return cmd
+
     spec_cfg = _normalize_speculative_config(config.get("speculative_config"))
     if spec_cfg:
         cmd.extend(
@@ -587,7 +898,7 @@ def _resolve_launch_model(model_id: str, revision: Optional[str] = None) -> str:
     try:
         snapshot_path = snapshot_download(
             repo_id=model_id,
-            cache_dir=os.environ.get("HF_HOME", "/root/.cache/huggingface"),
+            cache_dir=os.environ.get("HF_HOME", "/app/hf-cache"),
             revision=revision,
             local_files_only=True,
         )
@@ -626,11 +937,16 @@ def start_server(
     limit_mm_per_prompt: Optional[dict[str, int]] = None,
     mm_encoder_tp_mode: Optional[str] = None,
     mm_processor_cache_type: Optional[str] = None,
+    task_type: Optional[str] = None,
+    trust_remote_code: Optional[bool] = None,
+    instance_id: Optional[str] = None,
+    instance_name: Optional[str] = None,
+    create_new_instance: bool = False,
     download_model: bool = True,
     _memory_retry_done: bool = False,
 ) -> dict:
     """vLLM サーバーを起動する。None のパラメータは保存済み設定から読み込む。"""
-    result = {"success": False, "message": "", "steps": []}
+    result: dict[str, Any] = {"success": False, "message": "", "steps": []}
     config = load_config()
 
     # 渡されたパラメータで上書き
@@ -677,6 +993,40 @@ def start_server(
         config["mm_encoder_tp_mode"] = str(mm_encoder_tp_mode).strip()
     if mm_processor_cache_type is not None:
         config["mm_processor_cache_type"] = str(mm_processor_cache_type).strip()
+    if task_type is not None:
+        config["task_type"] = _normalize_task_type(task_type)
+    if trust_remote_code is not None:
+        config["trust_remote_code"] = bool(trust_remote_code)
+
+    config["task_type"] = _normalize_task_type(config.get("task_type"))
+    if create_new_instance or instance_id or instance_name:
+        resolved_instance_id = _resolve_new_instance_id(
+            instance_id=instance_id,
+            instance_name=instance_name,
+            model_id=str(config.get("model_id") or "vllm"),
+        )
+    else:
+        resolved_instance_id = _choose_instance_id_for_legacy_start()
+
+    config["instance_id"] = resolved_instance_id
+    config["instance_name"] = (
+        (instance_name or "").strip()
+        or (_registry_entry_for(resolved_instance_id) or {}).get("instance_name")
+        or resolved_instance_id
+    )
+    paths = _instance_paths(resolved_instance_id)
+    if resolved_instance_id != DEFAULT_INSTANCE_ID:
+        paths["dir"].mkdir(parents=True, exist_ok=True)
+
+    existing = get_instance_status(resolved_instance_id)
+    if existing.get("running"):
+        result["message"] = f"インスタンス {resolved_instance_id} は既に起動中です (PID: {existing.get('pid')})"
+        result["steps"].append("起動前チェック: 同一 instance_id が稼働中のため中止しました。")
+        result["instance_id"] = resolved_instance_id
+        return result
+
+    result["instance_id"] = resolved_instance_id
+    result["steps"].append(f"インスタンス ID: {resolved_instance_id} ({config['task_type']})")
 
     if config.get("enable_auto_tool_choice") and not _normalize_tool_call_parser(
         config.get("tool_call_parser")
@@ -728,7 +1078,9 @@ def start_server(
         )
     config["vllm_port"] = chosen_port
 
-    save_config(config)
+    normalized = _normalize_config_payload(config)
+    save_config(normalized)
+    save_config(normalized, resolved_instance_id)
 
     # NOTE: Current vLLM runtime in this project cannot serve Qwen GGUF architecture.
     # Fail fast with a clear message instead of launching then crashing.
@@ -746,7 +1098,7 @@ def start_server(
         result["steps"].append(f"モデルを確認中: {config['model_id']}")
         try:
             from huggingface_hub import snapshot_download
-            hf_home = os.environ.get("HF_HOME", "/root/.cache/huggingface")
+            hf_home = os.environ.get("HF_HOME", "/app/hf-cache")
             snapshot_download(
                 repo_id=config["model_id"],
                 cache_dir=hf_home,
@@ -757,12 +1109,12 @@ def start_server(
             return result
 
     # サーバー起動
-    cmd = _build_command(config)
+    cmd = _build_command(normalized)
     result["steps"].append(f"vLLM サーバーを起動中 (port {config['vllm_port']})")
     result["steps"].append(f"コマンド: {' '.join(cmd)}")
 
     try:
-        log = open(LOG_FILE, "w")
+        log = open(paths["log"], "w")
         env = _vllm_subprocess_env(config)
         proc = subprocess.Popen(
             cmd,
@@ -771,14 +1123,26 @@ def start_server(
             preexec_fn=os.setsid,
             env=env,
         )
-        PID_FILE.write_text(str(proc.pid))
+        paths["pid"].write_text(str(proc.pid))
+        _upsert_instance_registry(
+            {
+                "instance_id": resolved_instance_id,
+                "instance_name": config["instance_name"],
+                "task_type": config["task_type"],
+                "model_id": config["model_id"],
+                "vllm_port": config["vllm_port"],
+                "pid": proc.pid,
+                "started_at": time.time(),
+                "auto_restore": True,
+            }
+        )
         result["success"] = True
-        result["message"] = f"vLLM サーバー起動完了 (PID: {proc.pid})"
+        result["message"] = f"vLLM サーバー起動完了 (instance={resolved_instance_id}, PID: {proc.pid})"
         result["steps"].append(f"PID: {proc.pid}")
 
         time.sleep(3)
         if not _process_exists(proc.pid):
-            log_tail = get_log_lines(200)
+            log_tail = get_log_lines(200, instance_id=resolved_instance_id)
             if (
                 "Free memory on device" in log_tail
                 and "less than desired GPU memory utilization" in log_tail
@@ -788,6 +1152,7 @@ def start_server(
                 result["steps"].append(
                     f"GPUメモリ不足を検知したため、gpu_memory_utilization を {tuned} に下げて再試行します。"
                 )
+                paths["pid"].unlink(missing_ok=True)
                 return start_server(
                     model_id=config["model_id"],
                     context_length=config["context_length"],
@@ -797,13 +1162,18 @@ def start_server(
                     tensor_parallel_size=config["tensor_parallel_size"],
                     gpu_devices=config.get("gpu_devices"),
                     vllm_port=config["vllm_port"],
+                    task_type=config.get("task_type"),
+                    trust_remote_code=config.get("trust_remote_code"),
+                    instance_id=resolved_instance_id,
+                    instance_name=config.get("instance_name"),
+                    create_new_instance=True,
                     download_model=False,
                     _memory_retry_done=True,
                 )
             result["success"] = False
             result["message"] = "vLLM サーバーが起動直後に終了しました。ログを確認してください。"
             return result
-        status = get_status()
+        status = get_instance_status(resolved_instance_id)
         if status["healthy"]:
             result["steps"].append("サーバー正常に動作しています！")
         else:
@@ -815,56 +1185,183 @@ def start_server(
     return result
 
 
-def stop_server() -> dict:
-    """vLLM サーバーを停止する。"""
-    result = {"success": False, "message": ""}
+def stop_instance(instance_id: str) -> dict[str, Any]:
+    """指定 instance_id の vLLM サーバーを停止する。"""
+    paths = _instance_paths(instance_id)
+    result: dict[str, Any] = {"success": False, "message": "", "instance_id": instance_id}
 
-    if not PID_FILE.exists():
-        result["message"] = "実行中のサーバーはありません"
+    if not paths["pid"].exists():
+        result["message"] = f"インスタンス {instance_id} は実行されていません"
         result["success"] = True
         return result
 
     try:
-        pid = int(PID_FILE.read_text().strip())
+        pid = int(paths["pid"].read_text().strip())
         if _process_exists(pid):
             os.killpg(os.getpgid(pid), signal.SIGTERM)
             time.sleep(2)
             if _process_exists(pid):
                 os.killpg(os.getpgid(pid), signal.SIGKILL)
-            result["message"] = f"サーバー停止完了 (PID: {pid})"
+            result["message"] = f"インスタンス {instance_id} 停止完了 (PID: {pid})"
         else:
-            result["message"] = "サーバーは実行されていませんでした"
+            result["message"] = f"インスタンス {instance_id} は実行されていませんでした"
         result["success"] = True
     except Exception as e:
-        result["message"] = f"サーバー停止エラー: {str(e)}"
+        result["message"] = f"インスタンス停止エラー: {str(e)}"
 
-    PID_FILE.unlink(missing_ok=True)
+    paths["pid"].unlink(missing_ok=True)
+    entry = _registry_entry_for(instance_id)
+    if entry:
+        entry["auto_restore"] = False
+        entry.pop("pid", None)
+        _upsert_instance_registry(entry)
     return result
 
 
-def restart_server() -> dict:
+def _config_start_kwargs(config: dict[str, Any]) -> dict[str, Any]:
+    keys = (
+        "model_id",
+        "context_length",
+        "max_num_seqs",
+        "default_max_tokens",
+        "default_temperature",
+        "default_top_p",
+        "default_frequency_penalty",
+        "default_presence_penalty",
+        "gpu_memory_mode",
+        "gpu_memory_utilization",
+        "tensor_parallel_size",
+        "gpu_devices",
+        "speculative_config",
+        "enable_auto_tool_choice",
+        "tool_call_parser",
+        "force_stream",
+        "limit_mm_per_prompt",
+        "mm_encoder_tp_mode",
+        "mm_processor_cache_type",
+        "task_type",
+        "trust_remote_code",
+    )
+    return {k: config[k] for k in keys if k in config}
+
+
+def restore_managed_instances() -> list[dict[str, Any]]:
+    """Restart vLLM instances marked auto_restore after backend restart."""
+    results: list[dict[str, Any]] = []
+    for entry in _load_instances_registry():
+        if not entry.get("auto_restore"):
+            continue
+        instance_id = str(entry.get("instance_id") or "")
+        if not instance_id:
+            continue
+        if get_instance_status(instance_id).get("running"):
+            continue
+        config = load_config(instance_id)
+        start_result = start_server(
+            **_config_start_kwargs(config),
+            instance_id=instance_id,
+            instance_name=config.get("instance_name") or entry.get("instance_name"),
+            vllm_port=config.get("vllm_port") or entry.get("vllm_port"),
+            create_new_instance=True,
+            download_model=False,
+        )
+        results.append(
+            {
+                "instance_id": instance_id,
+                "success": start_result.get("success"),
+                "message": start_result.get("message"),
+            }
+        )
+    return results
+
+
+def stop_server(instance_id: Optional[str] = None) -> dict:
+    """vLLM サーバーを停止する。未指定時は default インスタンス。"""
+    return stop_instance(instance_id or DEFAULT_INSTANCE_ID)
+
+
+def restart_server(instance_id: Optional[str] = None) -> dict:
     """現在の設定でサーバーを再起動する。"""
-    config = load_config()
-    stop_result = stop_server()
+    target_id = instance_id or DEFAULT_INSTANCE_ID
+    config = load_config(target_id)
+    stop_result = stop_instance(target_id)
     time.sleep(2)
-    start_result = start_server(download_model=False)
+    start_result = start_server(
+        **{
+            k: config[k]
+            for k in (
+                "model_id",
+                "context_length",
+                "max_num_seqs",
+                "default_max_tokens",
+                "default_temperature",
+                "default_top_p",
+                "default_frequency_penalty",
+                "default_presence_penalty",
+                "gpu_memory_mode",
+                "gpu_memory_utilization",
+                "tensor_parallel_size",
+                "gpu_devices",
+                "speculative_config",
+                "enable_auto_tool_choice",
+                "tool_call_parser",
+                "force_stream",
+                "limit_mm_per_prompt",
+                "mm_encoder_tp_mode",
+                "mm_processor_cache_type",
+                "task_type",
+                "trust_remote_code",
+            )
+            if k in config
+        },
+        instance_id=target_id,
+        instance_name=config.get("instance_name"),
+        create_new_instance=True,
+        download_model=False,
+    )
     return {
         "success": start_result["success"],
         "message": f"停止: {stop_result['message']}\n起動: {start_result['message']}",
         "steps": start_result.get("steps", []),
+        "instance_id": target_id,
     }
 
 
-def get_log_lines(tail: int = 100) -> str:
+def get_log_lines(tail: int = 100, instance_id: Optional[str] = None) -> str:
     """vLLM サーバーのログを取得する。"""
-    if not LOG_FILE.exists():
+    paths = _instance_paths(instance_id or DEFAULT_INSTANCE_ID)
+    if not paths["log"].exists():
         return "ログファイルが見つかりません。"
     try:
-        with open(LOG_FILE, "r") as f:
+        with open(paths["log"], "r") as f:
             lines = f.readlines()
         return "".join(lines[-tail:])
     except IOError:
         return "ログファイルを読み込めませんでした。"
+
+
+def _managed_pid_map() -> dict[int, dict[str, Any]]:
+    mapping: dict[int, dict[str, Any]] = {}
+    candidates: list[tuple[str, Path]] = [(DEFAULT_INSTANCE_ID, PID_FILE)]
+    if INSTANCES_DIR.exists():
+        for sub in sorted(INSTANCES_DIR.iterdir()):
+            if sub.is_dir():
+                candidates.append((sub.name, sub / "vllm.pid"))
+    for instance_id, pid_path in candidates:
+        if not pid_path.exists():
+            continue
+        try:
+            pid = int(pid_path.read_text().strip())
+        except (ValueError, IOError):
+            continue
+        entry = _registry_entry_for(instance_id) or {}
+        cfg = load_config(instance_id)
+        mapping[pid] = {
+            "instance_id": instance_id,
+            "instance_name": entry.get("instance_name") or cfg.get("instance_name") or instance_id,
+            "task_type": entry.get("task_type") or cfg.get("task_type") or "chat",
+        }
+    return mapping
 
 
 def get_available_models() -> list:
@@ -1020,12 +1517,8 @@ def list_running_servers() -> list[dict[str, Any]]:
         return []
 
     servers: list[dict[str, Any]] = []
-    manager_pid = None
-    if PID_FILE.exists():
-        try:
-            manager_pid = int(PID_FILE.read_text().strip())
-        except Exception:
-            manager_pid = None
+    managed_pids = _managed_pid_map()
+    managed_pid_set = set(managed_pids.keys())
     backend_container_id, _ = _extract_container_from_cgroup(os.getpid())
 
     gpu_usage_by_pid = _read_gpu_process_memory_by_pid()
@@ -1103,15 +1596,21 @@ def list_running_servers() -> list[dict[str, Any]]:
                         if not vram_by_gpu_mb:
                             for gpu in mapped:
                                 vram_by_gpu_mb[str(int(gpu["index"]))] = round(float(gpu["memory_used_mb"]), 1)
-            managed_by_app = manager_pid == proc.info["pid"]
-            # PID_FILE は単一 PID しか保持しないため、複数起動時に古いプロセスが
-            # 「外部起動」に見えてしまう。backend と同じコンテナ内の vLLM は
-            # 管理対象として扱うことで判定を安定化する。
+            managed_by_app = proc.info["pid"] in managed_pid_set
             if not managed_by_app and backend_container_id and container_id:
                 managed_by_app = backend_container_id == container_id
+            instance_meta = managed_pids.get(proc.info["pid"], {})
+            cmd_task_type = "chat"
+            if "--runner" in cmd_joined and "pooling" in cmd_joined:
+                # registry に無い孤児プロセスは embedding とみなす（旧挙動）。
+                # rerank は managed registry の task_type を優先する。
+                cmd_task_type = "embedding"
             servers.append(
                 {
                     "pid": proc.info["pid"],
+                    "instance_id": instance_meta.get("instance_id"),
+                    "instance_name": instance_meta.get("instance_name"),
+                    "task_type": instance_meta.get("task_type") or cmd_task_type,
                     "model": metadata["model"],
                     "port": metadata["port"],
                     "context_length": metadata["context_length"],
@@ -1163,12 +1662,16 @@ def stop_server_by_pid(pid: int) -> dict[str, Any]:
     except Exception as exc:
         return {"success": False, "message": f"停止失敗: {exc}"}
 
-    if PID_FILE.exists():
-        try:
-            manager_pid = int(PID_FILE.read_text().strip())
-            if manager_pid == pid:
-                PID_FILE.unlink(missing_ok=True)
-        except Exception:
-            pass
+    for proc_pid, meta in _managed_pid_map().items():
+        if proc_pid == pid:
+            instance_id = str(meta["instance_id"])
+            paths = _instance_paths(instance_id)
+            paths["pid"].unlink(missing_ok=True)
+            entry = _registry_entry_for(instance_id)
+            if entry:
+                entry["auto_restore"] = False
+                entry.pop("pid", None)
+                _upsert_instance_registry(entry)
+            break
 
     return {"success": True, "message": f"PID {pid} を停止しました", "pid": pid}

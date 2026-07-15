@@ -1,5 +1,7 @@
 // API クライアント
 
+import { notifyAuthExpired } from "@/lib/auth-events";
+
 const API_BASE = (process.env.NEXT_PUBLIC_API_URL || "").replace(/\/$/, "");
 
 /**
@@ -83,6 +85,9 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
       } catch {
         /* ignore */
       }
+      if (resp.status === 401 && token) {
+        notifyAuthExpired();
+      }
       throw new ApiRequestError(`API Error: ${resp.status} ${detail}`, resp.status);
     }
 
@@ -135,6 +140,30 @@ export const api = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  // 永続APIトークン（PAT）: 自分自身
+  getMyTokens: () =>
+    request<{ tokens: import("@/types").ApiToken[]; count: number }>("/api/auth/me/tokens"),
+  createMyToken: (body: { name: string; expires_in_days?: number }) =>
+    request<import("@/types").ApiTokenCreated>("/api/auth/me/tokens", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  revokeMyToken: (tokenId: string) =>
+    request<{ success: boolean; id: string }>(`/api/auth/me/tokens/${encodeURIComponent(tokenId)}`, {
+      method: "DELETE",
+    }),
+
+  // 永続APIトークン（PAT）: 管理者による他ユーザー分の閲覧・強制失効
+  getUserTokens: (username: string) =>
+    request<{ tokens: import("@/types").ApiToken[]; count: number }>(
+      `/api/users/${encodeURIComponent(username)}/tokens`
+    ),
+  revokeUserToken: (username: string, tokenId: string) =>
+    request<{ success: boolean; id: string; username: string }>(
+      `/api/users/${encodeURIComponent(username)}/tokens/${encodeURIComponent(tokenId)}`,
+      { method: "DELETE" }
+    ),
+
   getUsers: () => request<import("@/types").AppUser[]>("/api/users"),
   createUser: (body: {
     username: string;
@@ -171,6 +200,12 @@ export const api = {
   stopServer: () =>
     request<import("@/types").ApiResponse>("/api/stop", { method: "POST" }),
   getRunningServers: () => request<import("@/types").RunningServer[]>("/api/servers"),
+  getInstances: () => request<import("@/types").ServerInstance[]>("/api/instances"),
+  stopInstance: (instance_id: string) =>
+    request<{ success: boolean; message: string; instance_id?: string }>("/api/instances/stop", {
+      method: "POST",
+      body: JSON.stringify({ instance_id }),
+    }),
   stopServerByPid: (pid: number) =>
     request<{ success: boolean; message: string; pid?: number }>("/api/servers/stop", {
       method: "POST",
@@ -178,6 +213,11 @@ export const api = {
     }),
   restartServer: () =>
     request<import("@/types").ApiResponse>("/api/restart", { method: "POST" }),
+  runSmokeTest: (instance_id: string) =>
+    request<import("@/types").SmokeTestResult>(
+      `/api/instances/${encodeURIComponent(instance_id)}/smoke-test`,
+      { method: "POST" }
+    ),
 
   // 設定・モデル
   getConfig: () => request<import("@/types").ServerConfig>("/api/config"),
@@ -223,9 +263,17 @@ export const api = {
         body: JSON.stringify({ model_id }),
       }
     ),
+  resumeModelDownload: (model_id: string) =>
+    request<import("@/types").DownloadJob>("/api/model-downloads/resume", {
+      method: "POST",
+      body: JSON.stringify({ model_id }),
+    }),
   getContextPresets: () =>
     request<import("@/types").ContextPreset[]>("/api/context-presets"),
-  getLog: (tail = 100) => request<{ log: string }>(`/api/log?tail=${tail}`),
+  getLog: (tail = 100, instanceId?: string) =>
+    request<{ log: string }>(
+      `/api/log?tail=${tail}${instanceId ? `&instance_id=${encodeURIComponent(instanceId)}` : ""}`
+    ),
   getSystemMetrics: () => request<import("@/types").SystemMetrics>("/api/system-metrics"),
 
   // LiteLLM
@@ -269,4 +317,88 @@ export const api = {
     request<import("@/types").LiteLLMProxyRequestDetail>(
       `/api/admin/request-history/${encodeURIComponent(recordId)}`
     ),
+
+  // チャット UI（バックエンドプロキシ経由）
+  getChatModels: () => request<import("@/types").ChatModelsResponse>("/api/chat/models"),
 };
+
+export interface StreamChatCompletionOptions {
+  model: string;
+  messages: import("@/types").ChatUiMessage[];
+  temperature?: number;
+  max_tokens?: number;
+  signal?: AbortSignal;
+  onDelta: (text: string) => void;
+}
+
+/** SSE ストリームでチャット補完を実行する（既存 request() は JSON のみ対応のため別実装） */
+export async function streamChatCompletion(options: StreamChatCompletionOptions): Promise<void> {
+  const url = API_BASE ? `${API_BASE}/api/chat/completions` : "/api/chat/completions";
+  const token = getToken();
+  const resp = await fetch(url, {
+    method: "POST",
+    signal: options.signal,
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify({
+      model: options.model,
+      messages: options.messages,
+      stream: true,
+      ...(options.temperature !== undefined ? { temperature: options.temperature } : {}),
+      ...(options.max_tokens !== undefined ? { max_tokens: options.max_tokens } : {}),
+    }),
+  });
+
+  if (!resp.ok) {
+    let detail = resp.statusText;
+    try {
+      const body = await resp.json();
+      if (body != null && typeof body === "object" && "detail" in body) {
+        const d = (body as { detail: unknown }).detail;
+        detail = typeof d === "string" ? d : JSON.stringify(d);
+      }
+    } catch {
+      /* ignore */
+    }
+    if (resp.status === 401 && token) {
+      notifyAuthExpired();
+    }
+    throw new ApiRequestError(`API Error: ${resp.status} ${detail}`, resp.status);
+  }
+
+  const reader = resp.body?.getReader();
+  if (!reader) {
+    throw new ApiRequestError("ストリーミング応答を読み取れませんでした");
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) continue;
+      const data = trimmed.slice(5).trim();
+      if (!data || data === "[DONE]") continue;
+      try {
+        const parsed = JSON.parse(data) as {
+          choices?: Array<{ delta?: { content?: string } }>;
+        };
+        const delta = parsed.choices?.[0]?.delta?.content;
+        if (typeof delta === "string" && delta.length > 0) {
+          options.onDelta(delta);
+        }
+      } catch {
+        /* ignore malformed SSE chunks */
+      }
+    }
+  }
+}

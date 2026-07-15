@@ -31,14 +31,21 @@ export function useMetricsWebSocket() {
   const connect = useCallback(() => {
     if (wsRef.current?.readyState === WebSocket.OPEN) return;
 
+    const token = window.localStorage.getItem("vllm_manager_token");
+    if (!token) {
+      setConnectionError("ログインが必要です");
+      return;
+    }
+
     const wsUrl = (() => {
+      const query = `token=${encodeURIComponent(token)}`;
       if (WS_BASE) {
         const protocol = WS_BASE.startsWith("https") ? "wss" : "ws";
         const baseUrl = WS_BASE.replace(/https?:\/\//, "");
-        return `${protocol}://${baseUrl}/ws/metrics`;
+        return `${protocol}://${baseUrl}/ws/metrics?${query}`;
       }
       const protocol = window.location.protocol === "https:" ? "wss" : "ws";
-      return `${protocol}://${window.location.host}/ws/metrics`;
+      return `${protocol}://${window.location.host}/ws/metrics?${query}`;
     })();
     const ws = new WebSocket(wsUrl);
 

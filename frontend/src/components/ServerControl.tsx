@@ -12,6 +12,7 @@ import type {
   ApiResponse,
   RunningServer,
   SystemGpuMetrics,
+  SmokeTestResult,
 } from "@/types";
 import { Copy, Info, Play, StopCircle, RotateCcw, Terminal } from "lucide-react";
 
@@ -260,6 +261,7 @@ export default function ServerControl({
   const downloadedModels = models.filter((m) => Boolean(m.downloaded));
   const [form, setForm] = useState({
     model_id: config?.model_id ?? downloadedModels[0]?.id ?? "",
+    instance_name: "",
     context_length: config?.context_length ?? 131072,
     max_num_seqs: config?.max_num_seqs ?? 6,
     default_max_tokens: config?.default_max_tokens ?? DEFAULT_MAX_TOKENS_FALLBACK,
@@ -293,7 +295,10 @@ export default function ServerControl({
   const [gpuMetrics, setGpuMetrics] = useState<SystemGpuMetrics[]>([]);
   const [runningServers, setRunningServers] = useState<RunningServer[]>([]);
   const [stoppingPid, setStoppingPid] = useState<number | null>(null);
+  const [stoppingInstanceId, setStoppingInstanceId] = useState<string | null>(null);
   const [copyMessage, setCopyMessage] = useState<string | null>(null);
+  const [smokeTestingId, setSmokeTestingId] = useState<string | null>(null);
+  const [smokeTestResults, setSmokeTestResults] = useState<Record<string, SmokeTestResult>>({});
 
   useEffect(() => {
     const loadGpuOptions = async () => {
@@ -329,6 +334,17 @@ export default function ServerControl({
     if (!exists) {
       setForm((prev) => ({ ...prev, model_id: downloadedModels[0].id }));
     }
+  }, [downloadedModels, form.model_id]);
+
+  useEffect(() => {
+    const model = downloadedModels.find((m) => m.id === form.model_id);
+    const recommendedContext = model?.recommended_context_length;
+    if (!recommendedContext) return;
+    setForm((prev) => {
+      if (prev.model_id !== model.id) return prev;
+      if (prev.context_length === recommendedContext) return prev;
+      return { ...prev, context_length: recommendedContext };
+    });
   }, [downloadedModels, form.model_id]);
 
   useEffect(() => {
@@ -370,10 +386,14 @@ export default function ServerControl({
       } = form;
       const payload: ServerStartRequest = {
         ...startFields,
-        speculative_config: buildSpeculativeConfig(specEnabled, specForm),
-        limit_mm_per_prompt: { image: limit_mm_image },
-        mm_encoder_tp_mode: mm_encoder_tp_mode || undefined,
-        mm_processor_cache_type: mm_processor_cache_type || undefined,
+        speculative_config: isPoolingTask ? {} : buildSpeculativeConfig(specEnabled, specForm),
+        limit_mm_per_prompt: isPoolingTask ? undefined : { image: limit_mm_image },
+        mm_encoder_tp_mode: isPoolingTask ? undefined : mm_encoder_tp_mode || undefined,
+        mm_processor_cache_type: isPoolingTask ? undefined : mm_processor_cache_type || undefined,
+        task_type: selectedTaskType,
+        trust_remote_code: Boolean(selectedModel?.trust_remote_code),
+        instance_name: form.instance_name.trim() || undefined,
+        create_new_instance: true,
       };
       const res = await api.startServer(payload);
       setResult(res);
@@ -410,6 +430,45 @@ export default function ServerControl({
       setResult({ success: false, message: String(err) });
     } finally {
       setAction("idle");
+    }
+  }
+
+  async function handleStopByInstance(instanceId: string) {
+    setStoppingInstanceId(instanceId);
+    try {
+      const res = await api.stopInstance(instanceId);
+      setResult({ success: res.success, message: res.message });
+      onActionComplete();
+      const data = await api.getRunningServers();
+      setRunningServers(data);
+    } catch (err) {
+      setResult({ success: false, message: String(err) });
+    } finally {
+      setStoppingInstanceId(null);
+    }
+  }
+
+  async function handleSmokeTest(instanceId: string) {
+    setSmokeTestingId(instanceId);
+    try {
+      const res = await api.runSmokeTest(instanceId);
+      setSmokeTestResults((prev) => ({ ...prev, [instanceId]: res }));
+    } catch (err) {
+      setSmokeTestResults((prev) => ({
+        ...prev,
+        [instanceId]: {
+          instance_id: instanceId,
+          success: false,
+          task_type: null,
+          latency_ms: null,
+          tokens_generated: null,
+          tokens_per_sec: null,
+          response_preview: null,
+          error: String(err),
+        },
+      }));
+    } finally {
+      setSmokeTestingId(null);
     }
   }
 
@@ -461,6 +520,15 @@ export default function ServerControl({
 
   const isBusy = action !== "idle";
   const hasDownloadedModels = downloadedModels.length > 0;
+  const selectedModel = downloadedModels.find((m) => m.id === form.model_id);
+  const selectedTaskType = selectedModel?.task_type ?? "chat";
+  const isPoolingTask = selectedTaskType === "embedding" || selectedTaskType === "rerank";
+  const taskTypeLabel =
+    selectedTaskType === "embedding"
+      ? "embedding"
+      : selectedTaskType === "rerank"
+        ? "rerank"
+        : "LLM";
 
   return (
     <div className="space-y-6 animate-slide-in">
@@ -473,7 +541,8 @@ export default function ServerControl({
         </h2>
 
         {/* モデル選択 */}
-        <div className="mb-4">
+        <div className="mb-4 grid grid-cols-1 md:grid-cols-2 gap-3">
+          <div>
           <FieldLabel
             label="モデル"
             hint="Hugging Face のモデル ID（例: org/name）です。vLLM 起動時はこの ID が `vllm serve <model>` に渡ります。一覧にはダウンロード済みモデルのみ出ます。未登録・未DL は「モデル管理」で追加・取得してください。量子化形式によっては vLLM 非対応のものがあります。"
@@ -486,7 +555,13 @@ export default function ServerControl({
           >
             {downloadedModels.map((m) => (
               <option key={m.id} value={m.id}>
-                {m.name} ({m.size})
+                {m.name} ({m.size}) [
+                {m.task_type === "embedding"
+                  ? "embedding"
+                  : m.task_type === "rerank"
+                    ? "rerank"
+                    : "LLM"}
+                ]
               </option>
             ))}
           </select>
@@ -495,7 +570,45 @@ export default function ServerControl({
               ダウンロード済みモデルがありません。先に「モデル管理」でモデルをダウンロードしてください。
             </p>
           )}
+          </div>
+          <div>
+            <FieldLabel
+              label="インスタンス名（任意）"
+              hint="複数モデルを同時起動するときの表示名です。空欄なら model ID から自動生成されます。既存インスタンスは停止せず、新しい vLLM プロセスが追加されます。"
+            />
+            <input
+              value={form.instance_name}
+              onChange={(e) => setForm({ ...form, instance_name: e.target.value })}
+              disabled={isBusy}
+              placeholder="例: chat-main / embed-jina"
+              className="w-full bg-bg-tertiary border border-white/10 rounded-lg px-3 py-2 text-white focus:outline-none focus:ring-2 focus:ring-accent-primary disabled:opacity-50"
+            />
+          </div>
         </div>
+        {isPoolingTask && (
+          <div className="mb-4 space-y-1 text-xs text-accent-primary">
+            <p>
+              {selectedTaskType === "rerank" ? "Reranker" : "埋め込み"}モデルは vLLM を `--runner pooling` で起動します。LLM
+              向けオプション（Speculative / Tool calling / Vision）は省略されます。
+            </p>
+            {selectedModel?.recommended_context_length && (
+              <p>
+                推奨コンテキスト長: {selectedModel.recommended_context_length.toLocaleString()} トークン
+                （モデル選択時に起動フォームへ反映されます）
+              </p>
+            )}
+            {selectedTaskType === "embedding" && selectedModel?.output_dimension && (
+              <p>出力次元: {selectedModel.output_dimension}（smoke test で確認できます）</p>
+            )}
+            {selectedModel?.license_note && (
+              <p className="text-amber-400">ライセンス: {selectedModel.license_note}</p>
+            )}
+            <p className="text-amber-400">
+              大規模 LLM と同じ GPU に常駐させると VRAM 不足になることがあります。必要なら
+              LLM を停止してから {taskTypeLabel} を起動してください。
+            </p>
+          </div>
+        )}
 
         {/* コンテキスト長 */}
         <div className="mb-4">
@@ -535,6 +648,7 @@ export default function ServerControl({
         </div>
 
         {/* スロット数 */}
+        {!isPoolingTask && (
         <NumberSliderField
           className="mb-4"
           label="最大同時リクエスト数（max_num_seqs）"
@@ -546,8 +660,10 @@ export default function ServerControl({
           step={1}
           disabled={isBusy}
         />
+        )}
 
         {/* デフォルト max_tokens */}
+        {!isPoolingTask && (
         <div className="mb-4">
           <NumberSliderField
             label="デフォルト max_tokens"
@@ -569,7 +685,10 @@ export default function ServerControl({
             初回の既定値は {DEFAULT_MAX_TOKENS_FALLBACK.toLocaleString()}（エージェント向け）。131,072 超は数値入力のみ。
           </p>
         </div>
+        )}
 
+        {!isPoolingTask && (
+        <>
         {/* 生成パラメータのデフォルト */}
         <div className="mb-4 grid grid-cols-1 md:grid-cols-2 gap-3">
           <div>
@@ -641,6 +760,8 @@ export default function ServerControl({
             />
           </div>
         </div>
+        </>
+        )}
 
         {/* GPU メモリ利用率 */}
         <div className="mb-4">
@@ -792,6 +913,8 @@ export default function ServerControl({
           )}
         </div>
 
+        {!isPoolingTask && (
+        <>
         {/* Vision / multimodal */}
         <div className="mb-6 rounded-lg border border-white/10 bg-bg-tertiary/40 p-4 space-y-3">
           <FieldLabel
@@ -1207,6 +1330,8 @@ export default function ServerControl({
             </div>
           )}
         </div>
+        </>
+        )}
 
         {/* ダウンロード制御 */}
         <label className="mb-6 flex items-center gap-2 text-sm text-gray-400">
@@ -1239,7 +1364,7 @@ export default function ServerControl({
             className="flex items-center gap-2 px-6 py-2.5 bg-accent-danger/20 hover:bg-accent-danger/30 text-accent-danger rounded-lg font-medium transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
           >
             <StopCircle className="w-4 h-4" />
-            {action === "stopping" ? "停止中..." : "停止"}
+            {action === "stopping" ? "停止中..." : "default 停止"}
           </button>
 
           <button
@@ -1266,7 +1391,7 @@ export default function ServerControl({
           </button>
         </div>
         <p className="text-xs text-gray-500 mb-3">
-          このホストで動作中の `vllm serve` プロセスを表示します。必要なものだけ個別に停止できます。
+          このホストで動作中の `vllm serve` プロセスを表示します。複数起動時は一覧から個別に停止できます（LLM / embedding / rerank 混在可）。
         </p>
         {copyMessage && <p className="mb-3 text-xs text-gray-400">{copyMessage}</p>}
         <div className="overflow-x-auto rounded-lg border border-white/10">
@@ -1274,6 +1399,8 @@ export default function ServerControl({
             <thead className="bg-bg-primary text-gray-400">
               <tr>
                 <th className="px-3 py-2 text-left font-medium">PID</th>
+                <th className="px-3 py-2 text-left font-medium">Instance</th>
+                <th className="px-3 py-2 text-left font-medium">種別</th>
                 <th className="px-3 py-2 text-left font-medium">モデル</th>
                 <th className="px-3 py-2 text-left font-medium">Port</th>
                 <th className="px-3 py-2 text-left font-medium">起動者/由来</th>
@@ -1289,6 +1416,16 @@ export default function ServerControl({
               {runningServers.map((server) => (
                 <tr key={server.pid} className="border-t border-white/5 bg-bg-tertiary/40">
                   <td className="px-3 py-2 font-mono text-xs">{server.pid}</td>
+                  <td className="px-3 py-2 text-xs text-gray-300">
+                    {server.instance_name || server.instance_id || "-"}
+                  </td>
+                  <td className="px-3 py-2 text-xs text-gray-300">
+                    {server.task_type === "embedding"
+                      ? "embedding"
+                      : server.task_type === "rerank"
+                        ? "rerank"
+                        : "LLM"}
+                  </td>
                   <td className="px-3 py-2 text-xs text-gray-300">
                     {server.model || "-"}
                   </td>
@@ -1348,19 +1485,58 @@ export default function ServerControl({
                     {server.managed_by_app ? "このアプリ管理" : "外部起動"}
                   </td>
                   <td className="px-3 py-2">
-                    <button
-                      onClick={() => handleStopByPid(server.pid)}
-                      disabled={stoppingPid === server.pid}
-                      className="px-3 py-1.5 rounded-lg bg-accent-danger/20 hover:bg-accent-danger/30 text-accent-danger disabled:opacity-50"
-                    >
-                      {stoppingPid === server.pid ? "停止中..." : "停止"}
-                    </button>
+                    <div className="flex flex-col gap-1">
+                      {server.instance_id && server.managed_by_app && (
+                        <button
+                          onClick={() => handleSmokeTest(server.instance_id!)}
+                          disabled={smokeTestingId === server.instance_id}
+                          className="px-3 py-1.5 rounded-lg bg-accent-primary/20 hover:bg-accent-primary/30 text-accent-primary disabled:opacity-50 text-xs"
+                        >
+                          {smokeTestingId === server.instance_id ? "疎通確認中..." : "疎通テスト"}
+                        </button>
+                      )}
+                      {server.instance_id && smokeTestResults[server.instance_id] && (
+                        <div
+                          className={`text-[10px] rounded px-2 py-1 ${
+                            smokeTestResults[server.instance_id].success
+                              ? "bg-accent-success/10 text-accent-success"
+                              : "bg-accent-danger/10 text-accent-danger"
+                          }`}
+                        >
+                          {smokeTestResults[server.instance_id].success ? (
+                            <>
+                              OK {smokeTestResults[server.instance_id].latency_ms}ms
+                              {smokeTestResults[server.instance_id].tokens_per_sec != null &&
+                                ` / ${smokeTestResults[server.instance_id].tokens_per_sec} tok/s`}
+                            </>
+                          ) : (
+                            smokeTestResults[server.instance_id].error || "失敗"
+                          )}
+                        </div>
+                      )}
+                      {server.instance_id && server.managed_by_app && (
+                        <button
+                          onClick={() => handleStopByInstance(server.instance_id!)}
+                          disabled={stoppingInstanceId === server.instance_id}
+                          className="px-3 py-1.5 rounded-lg bg-accent-danger/20 hover:bg-accent-danger/30 text-accent-danger disabled:opacity-50 text-xs"
+                        >
+                          {stoppingInstanceId === server.instance_id ? "停止中..." : "インスタンス停止"}
+                        </button>
+                      )}
+                      <button
+                        onClick={() => handleStopByPid(server.pid)}
+                        disabled={stoppingPid === server.pid}
+                        className="px-3 py-1.5 rounded-lg bg-accent-danger/20 hover:bg-accent-danger/30 text-accent-danger disabled:opacity-50 text-xs"
+                      >
+                        {stoppingPid === server.pid ? "停止中..." : "PID 停止"}
+                      </button>
+                    </div>
                   </td>
                 </tr>
               ))}
               {runningServers.length === 0 && (
                 <tr className="border-t border-white/5 bg-bg-tertiary/20">
-                  <td colSpan={10} className="px-3 py-6 text-center text-gray-500">
+                  <td colSpan={12} className="px-3 py-6 text-center text-gray-500">
                     起動中の vLLM サーバーはありません
                   </td>
                 </tr>

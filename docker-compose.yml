@@ -8,6 +8,10 @@ services:
         - HTTP_PROXY=${HTTP_PROXY:-}
         - HTTPS_PROXY=${HTTPS_PROXY:-}
         - NO_PROXY=${NO_PROXY:-}
+        # backend は非root ユーザー（既定 UID/GID 1000）で動作する。
+        # ホスト側ボリュームの権限を特定ユーザーに揃えたい場合のみ上書きする。
+        - APP_UID=${APP_UID:-1000}
+        - APP_GID=${APP_GID:-1000}
     container_name: vllm-manager-backend
     pid: host
     ports:
@@ -15,7 +19,7 @@ services:
       - "${VLLM_HOST_PORT:-18001}:${VLLM_PORT:-8001}"
     volumes:
       - vllm-data:/app/data
-      - hf-cache:/root/.cache/huggingface
+      - hf-cache:/app/hf-cache
       # 任意: ホスト CUDA Toolkit で上書きする場合は docker-compose.override.yml で
       # ${CUDA_HOME_HOST}:/usr/local/cuda:ro を追加（12.9 未満だと Blackwell NVFP4 は失敗）
     environment:
@@ -27,7 +31,8 @@ services:
       - https_proxy=${HTTPS_PROXY:-}
       - no_proxy=${NO_PROXY:-},litellm,backend,litellm-db,frontend
       - VLLM_PORT=${VLLM_PORT:-8001}
-      - HF_HOME=/root/.cache/huggingface
+      - HF_HOME=/app/hf-cache
+      - HF_HUB_DISABLE_XET=${HF_HUB_DISABLE_XET:-1}
       - HF_TOKEN=${HF_TOKEN:-}
       - HUGGINGFACE_HUB_TOKEN=${HF_TOKEN:-}
       - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY:-sk-vllm-default-key}

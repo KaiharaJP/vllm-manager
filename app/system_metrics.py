@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 from typing import Any
 
@@ -105,10 +106,88 @@ def _read_gpu_metrics() -> list[dict[str, Any]]:
     return gpus
 
 
+def _disk_usage(label: str, path: str) -> dict[str, Any] | None:
+    try:
+        usage = psutil.disk_usage(path)
+    except OSError:
+        return None
+    return {
+        "label": label,
+        "path": path,
+        "usage_percent": usage.percent,
+        "used_gb": round(usage.used / 1024 / 1024 / 1024, 2),
+        "total_gb": round(usage.total / 1024 / 1024 / 1024, 2),
+        # 重複排除専用の生バイト値（レスポンスには含めない）
+        "_raw_total": usage.total,
+        "_raw_used": usage.used,
+    }
+
+
+def _mount_device_id(path: str) -> Any:
+    """パスが乗っている実ファイルシステムを識別する ID（st_dev）を返す。
+
+    ディレクトリのパス文字列が違っても、Docker の named volume が
+    ホスト側で同一ディスク（同一パーティション）上に作られている場合は
+    st_dev が一致するため、見た目上の別ボリュームでも正しく重複排除できる。
+    `os.path.realpath` によるパス文字列比較だけでは、この「別ディレクトリだが
+    同じディスク」のケースを検出できない。
+    """
+    try:
+        return os.stat(path).st_dev
+    except OSError:
+        return None
+
+
+def _read_disks() -> list[dict[str, Any]]:
+    """ルートに加え、モデルキャッシュ・管理データの実マウント先の使用率も個別に返す。
+
+    HF キャッシュ（大容量モデル格納）と vllm-data（設定/監査ログ/APIキー）は
+    別ボリュームのことが多く、ルート("/")の使用率だけでは容量逼迫を見逃す。
+    ただし named volume が実際にはホストの同一ディスク上にある場合は
+    数値が重複するだけなので、次の2段階で重複排除する。
+
+    1. st_dev（マウントの実体）が一致する場合 -> 同一とみなす
+       （named volume 同士が同じホストパスにバインドされているケース）
+    2. st_dev が一致しなくても、使用量（バイト単位、丸め前）が完全一致する場合
+       -> 同一とみなす（コンテナ自身の overlay2 ルートと、ホスト側で
+       同じディスクにバインドされた named volume は Linux 上は別デバイス
+       として見えるが、実際には物理的に同じディスクであるケース）
+    """
+    seen_devices: set[Any] = set()
+    seen_usages: set[tuple[int, int]] = set()
+    disks: list[dict[str, Any]] = []
+
+    def _try_add(label: str, path: str) -> None:
+        device = _mount_device_id(path)
+        if device is not None and device in seen_devices:
+            return
+        entry = _disk_usage(label, path)
+        if not entry:
+            return
+        usage_key = (entry.pop("_raw_total"), entry.pop("_raw_used"))
+        if usage_key in seen_usages:
+            return
+        disks.append(entry)
+        seen_usages.add(usage_key)
+        if device is not None:
+            seen_devices.add(device)
+
+    _try_add("root", "/")
+
+    hf_home = os.environ.get("HF_HOME", "/app/hf-cache")
+    data_dir = os.environ.get("VLLM_MANAGER_DATA_DIR", "/tmp/vllm-manager-data")
+
+    for label, path in (("hf_cache", hf_home), ("vllm_data", data_dir)):
+        _try_add(label, path)
+
+    return disks
+
+
 def get_system_metrics() -> dict[str, Any]:
     cpu_percent = psutil.cpu_percent(interval=0.1)
     memory = psutil.virtual_memory()
-    disk = psutil.disk_usage("/")
+    disks = _read_disks()
+    disk = disks[0] if disks else {"usage_percent": 0.0, "used_gb": 0.0, "total_gb": 0.0}
     gpus = _read_gpu_metrics()
     gpu_processes = _read_gpu_processes()
 
@@ -123,11 +202,14 @@ def get_system_metrics() -> dict[str, Any]:
             "used_gb": round(memory.used / 1024 / 1024 / 1024, 2),
             "total_gb": round(memory.total / 1024 / 1024 / 1024, 2),
         },
+        # 後方互換: 従来どおりルート("/")の使用率を返す
         "disk": {
-            "usage_percent": disk.percent,
-            "used_gb": round(disk.used / 1024 / 1024 / 1024, 2),
-            "total_gb": round(disk.total / 1024 / 1024 / 1024, 2),
+            "usage_percent": disk["usage_percent"],
+            "used_gb": disk["used_gb"],
+            "total_gb": disk["total_gb"],
         },
+        # 新規: root / hf_cache / vllm_data を個別に返す（実体が同じマウントなら重複しない）
+        "disks": disks,
         "gpus": gpus,
         "gpu_processes": gpu_processes,
     }

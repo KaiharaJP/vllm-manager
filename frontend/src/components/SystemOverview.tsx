@@ -6,6 +6,12 @@ import { Cpu, HardDrive, MemoryStick, Monitor } from "lucide-react";
 import { api } from "@/lib/api";
 import type { SystemMetrics } from "@/types";
 
+const DISK_LABELS: Record<string, string> = {
+  root: "/",
+  hf_cache: "モデルキャッシュ",
+  vllm_data: "管理データ",
+};
+
 export default function SystemOverview() {
   const [metrics, setMetrics] = useState<SystemMetrics | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -68,12 +74,18 @@ export default function SystemOverview() {
               percent={metrics.memory.usage_percent}
               detail={`${metrics.memory.used_gb} / ${metrics.memory.total_gb} GB`}
             />
-            <MetricCard
-              icon={<HardDrive className="w-4 h-4 text-accent-warning" />}
-              title="SSD (/)"
-              percent={metrics.disk.usage_percent}
-              detail={`${metrics.disk.used_gb} / ${metrics.disk.total_gb} GB`}
-            />
+            {(metrics.disks && metrics.disks.length > 0
+              ? metrics.disks
+              : [{ label: "root", path: "/", ...metrics.disk }]
+            ).map((disk) => (
+              <MetricCard
+                key={disk.label}
+                icon={<HardDrive className="w-4 h-4 text-accent-warning" />}
+                title={`SSD (${DISK_LABELS[disk.label] || disk.label})`}
+                percent={disk.usage_percent}
+                detail={`${disk.used_gb} / ${disk.total_gb} GB`}
+              />
+            ))}
           </div>
 
           <div className="bg-bg-secondary rounded-xl border border-white/5 p-6">

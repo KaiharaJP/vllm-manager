@@ -3,8 +3,30 @@
 import { useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
 import { Download, EyeOff, Info, Plus } from "lucide-react";
-import { api } from "@/lib/api";
+import { api, ApiRequestError } from "@/lib/api";
 import type { DownloadJob, Model } from "@/types";
+
+type TaskType = "chat" | "embedding" | "rerank";
+type ModelTabKey = "llm" | "embedding" | "reranker";
+
+const MODEL_TABS: { key: ModelTabKey; label: string; taskType: TaskType }[] = [
+  { key: "llm", label: "LLM", taskType: "chat" },
+  { key: "embedding", label: "Embedding", taskType: "embedding" },
+  { key: "reranker", label: "Reranker", taskType: "rerank" },
+];
+
+function taskTypeLabel(taskType?: string | null): string {
+  if (taskType === "embedding") return "embedding";
+  if (taskType === "rerank") return "rerank";
+  return "LLM";
+}
+
+function modelMatchesTab(model: Model, tab: ModelTabKey): boolean {
+  const task = model.task_type || "chat";
+  if (tab === "llm") return task === "chat";
+  if (tab === "embedding") return task === "embedding";
+  return task === "rerank";
+}
 
 interface ModelManagementProps {
   models: Model[];
@@ -19,10 +41,15 @@ export default function ModelManagement({ models, jobs, onChanged }: ModelManage
     size: "",
     revision: "",
     recommended_context_length: 8192,
+    output_dimension: "",
+    license_note: "",
     gated: false,
     trust_remote_code: false,
+    task_type: "chat" as TaskType,
   });
   const [message, setMessage] = useState<string | null>(null);
+  const [resumingModelId, setResumingModelId] = useState<string | null>(null);
+  const [modelTab, setModelTab] = useState<ModelTabKey>("llm");
   const [hiddenModelIds, setHiddenModelIds] = useState<string[]>([]);
   const [jobSpeedBytesPerSec, setJobSpeedBytesPerSec] = useState<Record<string, number>>({});
   const [jobSnapshot, setJobSnapshot] = useState<Record<string, { bytes: number; ts: number }>>({});
@@ -85,13 +112,29 @@ export default function ModelManagement({ models, jobs, onChanged }: ModelManage
   async function registerModel() {
     setMessage(null);
     try {
+      const outputDimension = form.output_dimension.trim()
+        ? Number.parseInt(form.output_dimension, 10)
+        : undefined;
       await api.registerModel({
         ...form,
         revision: form.revision || null,
         name: form.name || form.id,
         size: form.size || "unknown",
+        output_dimension: Number.isFinite(outputDimension) ? outputDimension : undefined,
+        license_note: form.license_note.trim() || undefined,
       });
-      setForm({ ...form, id: "", name: "", size: "", revision: "" });
+      setForm({
+        id: "",
+        name: "",
+        size: "",
+        revision: "",
+        recommended_context_length: 8192,
+        output_dimension: "",
+        license_note: "",
+        gated: false,
+        trust_remote_code: false,
+        task_type: form.task_type,
+      });
       setMessage("モデルを登録しました");
       onChanged();
     } catch (err) {
@@ -111,18 +154,51 @@ export default function ModelManagement({ models, jobs, onChanged }: ModelManage
   }
 
   async function cancelAndResume(modelId: string) {
+    if (resumingModelId) return;
     setMessage(null);
+    setResumingModelId(modelId);
     try {
-      const cancelled = await api.cancelModelDownloads(modelId);
-      await api.startModelDownload(modelId, true);
-      setMessage(
-        cancelled.cancelled_count > 0
-          ? `停止中ジョブを ${cancelled.cancelled_count} 件キャンセルして再開しました`
-          : "再開ジョブを開始しました"
-      );
+      const job = await api.resumeModelDownload(modelId);
+      const resumed = jobUsesByteProgress(job)
+        ? `${formatBytes(job.downloaded_bytes)} / ${formatBytes(job.total_bytes)} (${jobProgressPercent(job)}%)`
+        : `${job.progress}%`;
+      setMessage(`続きから再開しました: ${resumed}`);
       onChanged();
     } catch (err) {
-      setMessage(String(err));
+      if (err instanceof ApiRequestError && err.status === 401) {
+        setMessage("セッションが失効しました。再ログインしてください。");
+      } else {
+        setMessage(err instanceof ApiRequestError ? err.message : String(err));
+      }
+    } finally {
+      setResumingModelId(null);
+    }
+  }
+
+  async function updateTaskType(model: Model, task_type: TaskType) {
+    if ((model.task_type || "chat") === task_type) return;
+    setMessage(null);
+    try {
+      await api.registerModel({
+        id: model.id,
+        name: model.name,
+        size: model.size,
+        revision: model.revision || undefined,
+        gated: Boolean(model.gated),
+        trust_remote_code: Boolean(model.trust_remote_code),
+        recommended_context_length: model.recommended_context_length || 8192,
+        output_dimension: model.output_dimension || undefined,
+        license_note: model.license_note || undefined,
+        task_type,
+        source: model.source === "default" ? "custom" : model.source,
+      });
+      setMessage(`${model.name} の用途を ${taskTypeLabel(task_type)} に変更しました`);
+      if (task_type === "chat") setModelTab("llm");
+      else if (task_type === "embedding") setModelTab("embedding");
+      else setModelTab("reranker");
+      onChanged();
+    } catch (err) {
+      setMessage(err instanceof ApiRequestError ? err.message : String(err));
     }
   }
 
@@ -146,7 +222,33 @@ export default function ModelManagement({ models, jobs, onChanged }: ModelManage
   function formatBytes(value = 0) {
     if (!value) return "-";
     const gb = value / 1024 / 1024 / 1024;
-    return `${gb.toFixed(2)} GB`;
+    if (gb >= 1) return `${gb.toFixed(2)} GB`;
+    const mb = value / 1024 / 1024;
+    if (mb >= 1) return `${mb.toFixed(1)} MB`;
+    const kb = value / 1024;
+    if (kb >= 1) return `${kb.toFixed(0)} KB`;
+    return `${value} B`;
+  }
+
+  function jobUsesByteProgress(job: DownloadJob) {
+    return job.total_bytes >= 1_000_000;
+  }
+
+  function jobProgressPercent(job: DownloadJob) {
+    if (jobUsesByteProgress(job) && job.downloaded_bytes > 0) {
+      return Math.min(100, Math.round((job.downloaded_bytes / job.total_bytes) * 100));
+    }
+    return job.progress;
+  }
+
+  function jobProgressLabel(job: DownloadJob) {
+    if (jobUsesByteProgress(job)) {
+      return `${formatBytes(job.downloaded_bytes)} / ${formatBytes(job.total_bytes)} (${jobProgressPercent(job)}%)`;
+    }
+    if (job.downloaded_bytes > 0) {
+      return `${formatBytes(job.downloaded_bytes)} (${job.progress}%)`;
+    }
+    return `${job.progress}%`;
   }
 
   const formatSpeed = useMemo(
@@ -176,8 +278,19 @@ export default function ModelManagement({ models, jobs, onChanged }: ModelManage
           <InfoTooltip text="ここでは、このアプリで扱うモデル候補だけを登録します。実ファイルのダウンロードは下の一覧から実行します。" />
         </h2>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-          <Field label="Hugging Face repo_id" hint="例: Qwen/Qwen2.5-7B-Instruct または lovedheart/Qwen3.5-9B-FP8">
-            <input className="w-full bg-bg-tertiary border border-white/10 rounded-lg px-3 py-2" placeholder="organization/model-name" value={form.id} onChange={(e) => setForm({ ...form, id: e.target.value })} />
+          <Field label="Hugging Face repo_id" hint="LLM 例: Qwen/Qwen2.5-7B-Instruct / embedding 例: jinaai/jina-embeddings-v3 / rerank 例: BAAI/bge-reranker-v2-m3">
+            <input
+              className="w-full bg-bg-tertiary border border-white/10 rounded-lg px-3 py-2"
+              placeholder={
+                form.task_type === "embedding"
+                  ? "organization/embedding-model"
+                  : form.task_type === "rerank"
+                    ? "organization/reranker-model"
+                    : "organization/model-name"
+              }
+              value={form.id}
+              onChange={(e) => setForm({ ...form, id: e.target.value })}
+            />
           </Field>
           <Field label="画面に表示する名前" hint="空欄なら repo_id をそのまま使います">
             <input className="w-full bg-bg-tertiary border border-white/10 rounded-lg px-3 py-2" placeholder="例: Qwen3.5 9B FP8" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} />
@@ -188,6 +301,60 @@ export default function ModelManagement({ models, jobs, onChanged }: ModelManage
           <Field label="revision / branch" hint="通常は空欄でOK。特定の branch・commit を使う場合だけ指定します">
             <input className="w-full bg-bg-tertiary border border-white/10 rounded-lg px-3 py-2" placeholder="main / commit hash など" value={form.revision} onChange={(e) => setForm({ ...form, revision: e.target.value })} />
           </Field>
+          <Field label="用途 (task_type)" hint="LLM = 生成・チャット、embedding = ベクトル埋め込み、rerank = スコアリング（pooling 系は --runner pooling）">
+            <select
+              className="w-full bg-bg-tertiary border border-white/10 rounded-lg px-3 py-2"
+              value={form.task_type}
+              onChange={(e) => {
+                const task_type = e.target.value as TaskType;
+                setForm((prev) => ({
+                  ...prev,
+                  task_type,
+                  recommended_context_length:
+                    task_type === "embedding" || task_type === "rerank"
+                      ? 8192
+                      : prev.recommended_context_length,
+                }));
+              }}
+            >
+              <option value="chat">LLM（生成・チャット）</option>
+              <option value="embedding">Embedding（ベクトル化）</option>
+              <option value="rerank">Reranker（スコア / rerank）</option>
+            </select>
+          </Field>
+          {(form.task_type === "embedding" || form.task_type === "rerank") && (
+            <>
+              <Field label="推奨コンテキスト長" hint="起動時の `--max-model-len` の目安。多くの embedding / rerank モデルは 8192 以下です">
+                <input
+                  type="number"
+                  min={1024}
+                  className="w-full bg-bg-tertiary border border-white/10 rounded-lg px-3 py-2"
+                  value={form.recommended_context_length}
+                  onChange={(e) =>
+                    setForm({ ...form, recommended_context_length: Number.parseInt(e.target.value, 10) || 8192 })
+                  }
+                />
+              </Field>
+              {form.task_type === "embedding" && (
+                <Field label="出力次元（任意）" hint="既知なら登録（例: 1792）。smoke test で実測値と照合できます">
+                  <input
+                    className="w-full bg-bg-tertiary border border-white/10 rounded-lg px-3 py-2"
+                    placeholder="例: 1792"
+                    value={form.output_dimension}
+                    onChange={(e) => setForm({ ...form, output_dimension: e.target.value })}
+                  />
+                </Field>
+              )}
+              <Field label="ライセンス注意（任意）" hint="NonCommercial など運用上の注意をメモできます">
+                <input
+                  className="w-full bg-bg-tertiary border border-white/10 rounded-lg px-3 py-2"
+                  placeholder="例: NonCommercial License"
+                  value={form.license_note}
+                  onChange={(e) => setForm({ ...form, license_note: e.target.value })}
+                />
+              </Field>
+            </>
+          )}
         </div>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-4 text-sm text-gray-400">
           <label className="flex items-start gap-2 bg-bg-tertiary/60 border border-white/5 rounded-lg p-3">
@@ -234,13 +401,42 @@ export default function ModelManagement({ models, jobs, onChanged }: ModelManage
             </button>
           )}
         </div>
+        <div className="mb-4 flex flex-wrap gap-2">
+          {MODEL_TABS.map((tab) => {
+            const count = models.filter(
+              (model) => !hiddenModelIds.includes(model.id) && modelMatchesTab(model, tab.key)
+            ).length;
+            const active = modelTab === tab.key;
+            return (
+              <button
+                key={tab.key}
+                type="button"
+                onClick={() => setModelTab(tab.key)}
+                className={`px-3 py-1.5 text-sm rounded-lg border ${
+                  active
+                    ? "bg-accent-primary/20 border-accent-primary/50 text-accent-primary"
+                    : "bg-bg-primary/60 border-white/10 text-gray-400 hover:text-white"
+                }`}
+              >
+                {tab.label}
+                <span className="ml-1.5 text-xs opacity-80">{count}</span>
+              </button>
+            );
+          })}
+        </div>
         <div className="space-y-3">
           {models.length === 0 && (
             <div className="bg-bg-tertiary rounded-lg p-4 text-sm text-gray-400">
               まだモデルが登録されていません。上のフォームで Hugging Face の repo_id を登録してください。
             </div>
           )}
-          {models.filter((model) => !hiddenModelIds.includes(model.id)).map((model) => {
+          {models.filter((model) => !hiddenModelIds.includes(model.id) && modelMatchesTab(model, modelTab)).length === 0 &&
+            models.length > 0 && (
+            <div className="bg-bg-tertiary rounded-lg p-4 text-sm text-gray-400">
+              このタブに表示するモデルはありません。
+            </div>
+          )}
+          {models.filter((model) => !hiddenModelIds.includes(model.id) && modelMatchesTab(model, modelTab)).map((model) => {
             const now = Date.now() / 1000;
             const activeJob = jobs.find((job) => job.model_id === model.id && ["queued", "running"].includes(job.status));
             const activeJobs = jobs.filter(
@@ -256,9 +452,14 @@ export default function ModelManagement({ models, jobs, onChanged }: ModelManage
               Boolean(latestFailedJob) &&
               (!latestCompletedJob || latestFailedJob.updated_at > latestCompletedJob.updated_at);
             const activeIdleSeconds = activeJob ? Math.max(0, now - activeJob.updated_at) : 0;
-            const isLikelyStalled = Boolean(activeJob) && activeIdleSeconds >= 120;
+            const isLikelyStalled =
+              Boolean(activeJob) &&
+              activeIdleSeconds >= 90 &&
+              (jobSpeedBytesPerSec[activeJob?.id ?? ""] || 0) <= 0;
+            const isMaybeSlow = Boolean(activeJob) && activeIdleSeconds >= 45 && !isLikelyStalled;
+            const activeProgress = activeJob ? jobProgressPercent(activeJob) : 0;
             const displayStatus = activeJob
-              ? `${activeJob.status === "queued" ? "待機中" : "ダウンロード中"}: ${activeJob.progress}%`
+              ? `${activeJob.status === "queued" ? "待機中" : "ダウンロード中"}: ${jobProgressLabel(activeJob)}`
               : model.downloaded
                 ? `ダウンロード済み ${formatBytes(model.cache_size_bytes)}`
                 : "未ダウンロード";
@@ -268,15 +469,39 @@ export default function ModelManagement({ models, jobs, onChanged }: ModelManage
                   <p className="font-medium">{model.name}</p>
                   <p className="text-xs text-gray-500 font-mono">{model.id}</p>
                   <p className="text-xs text-gray-500">
-                    {model.size} / {displayStatus}
+                    {model.size} / {taskTypeLabel(model.task_type)} / {displayStatus}
+                    {model.task_type === "embedding" && model.output_dimension
+                      ? ` / ${model.output_dimension}d`
+                      : ""}
                   </p>
+                  <div className="mt-2 flex items-center gap-2">
+                    <label className="text-xs text-gray-500 whitespace-nowrap" htmlFor={`task-type-${model.id}`}>
+                      用途
+                    </label>
+                    <select
+                      id={`task-type-${model.id}`}
+                      className="bg-bg-primary border border-white/10 rounded-lg px-2 py-1 text-xs text-gray-200"
+                      value={model.task_type || "chat"}
+                      disabled={Boolean(activeJob)}
+                      onChange={(e) => updateTaskType(model, e.target.value as TaskType)}
+                    >
+                      <option value="chat">LLM</option>
+                      <option value="embedding">Embedding</option>
+                      <option value="rerank">Reranker</option>
+                    </select>
+                  </div>
                   {activeJob && (
                     <div className="mt-2">
                       <div className="h-2 bg-bg-primary rounded-full overflow-hidden">
-                        <div className="h-full bg-accent-primary" style={{ width: `${activeJob.progress}%` }} />
+                        <div
+                          className={`h-full bg-accent-primary ${activeProgress === 0 && activeJob.status === "running" ? "animate-pulse w-1/3" : ""}`}
+                          style={{
+                            width: activeProgress > 0 ? `${activeProgress}%` : activeJob.status === "running" ? "33%" : "0%",
+                          }}
+                        />
                       </div>
                       <p className="text-xs text-gray-500 mt-1">
-                        {activeJob.status === "queued" ? "待機中" : "ダウンロード中"}: {activeJob.progress}%
+                        {activeJob.status === "queued" ? "待機中" : "ダウンロード中"}: {jobProgressLabel(activeJob)}
                       </p>
                       <p className="text-xs text-gray-500">
                         速度: {formatSpeed(jobSpeedBytesPerSec[activeJob.id] || 0)}
@@ -291,11 +516,29 @@ export default function ModelManagement({ models, jobs, onChanged }: ModelManage
                       )}
                     </div>
                   )}
-                  {isLikelyStalled && (
-                    <div className="mt-2 rounded-md border border-accent-warning/40 bg-accent-warning/10 p-2">
-                      <p className="text-xs text-accent-warning">
-                        2分以上更新が止まっています。下の「停止時に再開」で新しいダウンロードジョブを作成できます。
+                  {isMaybeSlow && (
+                    <div className="mt-2 rounded-md border border-white/10 bg-bg-primary/60 p-2">
+                      <p className="text-xs text-gray-400">
+                        進捗の更新が少し遅いです。大きなファイルは一時的に止まって見えることがあります。
                       </p>
+                    </div>
+                  )}
+                  {isLikelyStalled && (
+                    <div className="mt-2 rounded-md border border-accent-warning/40 bg-accent-warning/10 p-2 space-y-2">
+                      <p className="text-xs text-accent-warning font-medium">
+                        進捗が {formatElapsed(activeIdleSeconds)}止まっています
+                      </p>
+                      <p className="text-xs text-gray-300">
+                        対処: 「続きから再開」を押すと、ダウンロード済み部分を再利用して再開します。
+                        90秒以上止まった場合はサーバー側でも自動再開を試みます（最大3回）。
+                      </p>
+                      <button
+                        onClick={() => cancelAndResume(model.id)}
+                        disabled={resumingModelId === model.id}
+                        className="px-3 py-2 text-xs bg-accent-warning/20 border border-accent-warning/40 text-accent-warning rounded-lg disabled:opacity-50"
+                      >
+                        {resumingModelId === model.id ? "再開中..." : "続きから再開"}
+                      </button>
                     </div>
                   )}
                   {!activeJob && latestCompletedJob && (
@@ -322,20 +565,13 @@ export default function ModelManagement({ models, jobs, onChanged }: ModelManage
                   >
                     {activeJob ? "処理中..." : model.downloaded ? "再ダウンロード" : "このモデルをダウンロード"}
                   </button>
-                  {isLikelyStalled && (
-                    <button
-                      onClick={() => cancelAndResume(model.id)}
-                      className="px-3 py-2 text-xs bg-accent-warning/20 border border-accent-warning/40 text-accent-warning rounded-lg"
-                    >
-                      キャンセルして再開
-                    </button>
-                  )}
                   {activeJob && !isLikelyStalled && (
                     <button
                       onClick={() => cancelAndResume(model.id)}
-                      className="px-3 py-2 text-xs bg-bg-primary/80 border border-white/10 text-gray-300 rounded-lg"
+                      disabled={resumingModelId === model.id}
+                      className="px-3 py-2 text-xs bg-bg-primary/80 border border-white/10 text-gray-300 rounded-lg disabled:opacity-50"
                     >
-                      いったんキャンセルして再開
+                      {resumingModelId === model.id ? "再開中..." : "続きから再開"}
                     </button>
                   )}
                   {!model.downloaded && (

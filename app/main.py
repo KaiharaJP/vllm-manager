@@ -10,7 +10,7 @@ from urllib.parse import quote, urlencode
 from contextlib import asynccontextmanager, suppress
 from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect, APIRouter, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect, APIRouter, HTTPException, Request, Response, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -20,36 +20,58 @@ from app.server_manager import (
     get_status,
     start_server,
     stop_server,
+    stop_instance,
     stop_server_by_pid,
     restart_server,
     get_log_lines,
     get_context_presets,
     list_running_servers,
+    list_instances,
     load_config,
+    restore_managed_instances,
+    run_smoke_test,
 )
 from app.system_metrics import get_system_metrics
 from app.auth import (
     authenticate,
+    check_login_allowed,
+    collect_security_warnings,
+    create_api_key,
     create_session,
     get_current_user,
+    get_user_from_token,
+    list_api_keys,
     load_users,
     public_user,
+    record_login_failure,
+    record_login_success,
     require_admin,
+    revoke_api_key,
     upsert_user,
     update_user,
+    user_must_change_password,
 )
+from app.audit_log import read_recent as read_audit_log
 from app.event_bus import event_bus
 from app.litellm_client import litellm_request, status as litellm_status
+from app.chat_keys import chat_key_allows_wildcard, get_or_create_chat_key, regenerate_chat_key
 from app.model_manager import (
     cancel_active_download_jobs,
     delete_model,
     delete_model_cache,
+    inspect_stalled_download_jobs,
     load_jobs,
     load_model_catalog,
+    migrate_misclassified_rerank_models,
+    reconcile_orphan_download_jobs,
+    resume_download_job,
     save_model,
     start_download_job,
 )
 from app.metrics_scraper import MetricsScraper
+from app.health_watchdog import HealthWatchdog
+from app.resource_watchdog import ResourceWatchdog
+from app.download_watchdog import DownloadWatchdog
 from app.litellm_request_track import (
     get_active_detail,
     header_marks_litellm,
@@ -144,7 +166,7 @@ def _is_backend_self_port(port: Any) -> bool:
 
 class ServerStartRequest(BaseModel):
     model_id: str
-    context_length: int = Field(default=131072, ge=1024, le=262144)
+    context_length: Optional[int] = Field(default=None, ge=1024, le=262144)
     max_num_seqs: int = Field(default=6, ge=1, le=20)
     default_max_tokens: int = Field(default=512, ge=1, le=262144)
     default_temperature: float = Field(default=0.7, ge=0.0, le=2.0)
@@ -163,6 +185,37 @@ class ServerStartRequest(BaseModel):
     limit_mm_per_prompt: Optional[dict[str, int]] = None
     mm_encoder_tp_mode: str = ""
     mm_processor_cache_type: str = ""
+    task_type: Optional[str] = Field(default=None, pattern="^(chat|embedding|rerank)$")
+    trust_remote_code: Optional[bool] = None
+    instance_id: Optional[str] = None
+    instance_name: Optional[str] = None
+    create_new_instance: bool = False
+
+
+def _resolve_start_request(req: ServerStartRequest, catalog_entry: dict[str, Any]) -> dict[str, Any]:
+    """HTTP 起動リクエストをカタログ情報とマージして start_server 向けに正規化する。"""
+    task_type = req.task_type or catalog_entry.get("task_type") or "chat"
+    context_length = req.context_length
+    if context_length is None:
+        context_length = catalog_entry.get("recommended_context_length")
+    if context_length is None:
+        context_length = 8192 if task_type in {"embedding", "rerank"} else 131072
+    trust_remote_code = (
+        req.trust_remote_code
+        if req.trust_remote_code is not None
+        else bool(catalog_entry.get("trust_remote_code"))
+    )
+    create_new_instance = req.create_new_instance or task_type in {"embedding", "rerank"}
+    return {
+        "task_type": task_type,
+        "context_length": int(context_length),
+        "trust_remote_code": trust_remote_code,
+        "create_new_instance": create_new_instance,
+    }
+
+
+class StopInstanceRequest(BaseModel):
+    instance_id: str = Field(min_length=1, max_length=64)
 
 
 class ServerStatusResponse(BaseModel):
@@ -218,12 +271,30 @@ class SelfApiKeyRequest(BaseModel):
     tpm_limit: Optional[int] = None
 
 
+class SelfTokenCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1, max_length=128)
+    expires_in_days: Optional[int] = Field(default=None, ge=1, le=3650)
+
+
 class AdminUserApiKeyRequest(BaseModel):
     models: list[str] = Field(..., min_length=1)
     max_budget: Optional[float] = None
     budget_duration: Optional[str] = None
     rpm_limit: Optional[int] = None
     tpm_limit: Optional[int] = None
+
+
+class ChatUiMessage(BaseModel):
+    role: str
+    content: str
+
+
+class ChatUiCompletionRequest(BaseModel):
+    model: str
+    messages: list[ChatUiMessage] = Field(..., min_length=1)
+    stream: bool = True
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
 
 
 async def _litellm_list_keys_detailed() -> list[dict[str, Any]]:
@@ -268,7 +339,10 @@ class ModelRegisterRequest(BaseModel):
     trust_remote_code: bool = False
     recommended_context_length: int = Field(default=8192, ge=1024)
     required_gpu_memory_gb: Optional[float] = None
+    output_dimension: Optional[int] = Field(default=None, ge=1, le=65536)
+    license_note: Optional[str] = Field(default=None, max_length=256)
     allowed_roles: list[str] = Field(default_factory=lambda: ["admin", "user"])
+    task_type: str = Field(default="chat", pattern="^(chat|embedding|rerank)$")
 
 
 class DownloadRequest(BaseModel):
@@ -282,12 +356,15 @@ class LiteLLMProxyRequest(BaseModel):
 
 # --- グローバル状態 ---
 metrics_scraper: Optional[MetricsScraper] = None
+health_watchdog: Optional[HealthWatchdog] = None
+resource_watchdog: Optional[ResourceWatchdog] = None
+download_watchdog: Optional[DownloadWatchdog] = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # スタートアップ
-    global metrics_scraper
+    global metrics_scraper, health_watchdog, resource_watchdog, download_watchdog
     metrics_scraper = MetricsScraper(
         vllm_metrics_url=f"http://localhost:{os.environ.get('VLLM_PORT', '8001')}/metrics",
         scrape_interval=5.0,
@@ -295,11 +372,57 @@ async def lifespan(app: FastAPI):
     )
     await metrics_scraper.start()
 
+    restore_results = restore_managed_instances()
+    if restore_results:
+        await event_bus.publish(
+            "server_restore",
+            {"results": restore_results},
+            message=f"Restored {sum(1 for r in restore_results if r.get('success'))}/{len(restore_results)} vLLM instance(s)",
+            actor="system",
+        )
+
+    health_watchdog = HealthWatchdog(
+        check_interval=30.0,
+        event_publisher=event_bus.publish,
+        smoke_test_runner=run_smoke_test,
+    )
+    await health_watchdog.start()
+
+    resource_watchdog = ResourceWatchdog(event_publisher=event_bus.publish)
+    await resource_watchdog.start()
+
+    download_watchdog = DownloadWatchdog(inspector=inspect_stalled_download_jobs)
+    await download_watchdog.start()
+
+    orphan_actions = reconcile_orphan_download_jobs(actor="system")
+    if orphan_actions:
+        await event_bus.publish(
+            "model_download",
+            {"actions": orphan_actions},
+            message=f"Reconciled {len(orphan_actions)} orphan download job(s)",
+            actor="system",
+        )
+
+    rerank_migrations = migrate_misclassified_rerank_models()
+    if rerank_migrations:
+        await event_bus.publish(
+            "model_registered",
+            {"migrations": rerank_migrations},
+            message=f"Migrated {len(rerank_migrations)} model(s) from embedding to rerank",
+            actor="system",
+        )
+
     yield
 
     # シャットダウン
     if metrics_scraper:
         await metrics_scraper.stop()
+    if health_watchdog:
+        await health_watchdog.stop()
+    if resource_watchdog:
+        await resource_watchdog.stop()
+    if download_watchdog:
+        await download_watchdog.stop()
 
 
 # --- アプリケーション ---
@@ -310,9 +433,16 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+def _cors_origins() -> list[str]:
+    raw = os.environ.get("VLLM_MANAGER_CORS_ORIGINS", "").strip()
+    if not raw or raw == "*":
+        return ["*"]
+    return [item.strip() for item in raw.split(",") if item.strip()]
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -324,17 +454,28 @@ router = APIRouter()
 # --- サーバー管理 API ---
 
 @router.post("/api/auth/login")
-async def api_login(req: LoginRequest):
+async def api_login(req: LoginRequest, request: Request):
+    client_ip = request.client.host if request.client else None
+    check_login_allowed(req.username, client_ip)
     user = authenticate(req.username, req.password)
     if not user:
+        record_login_failure(req.username, client_ip)
         raise HTTPException(status_code=401, detail="Invalid username or password")
+    record_login_success(req.username, client_ip)
     token = create_session(user)
-    return {"token": token, "user": public_user(user)}
+    public = public_user(user)
+    public["must_change_password"] = user_must_change_password(public["username"])
+    if public.get("role") == "admin":
+        public = {**public, "security_warnings": collect_security_warnings()}
+    return {"token": token, "user": public}
 
 
 @router.get("/api/auth/me")
 async def api_me(user: dict = Depends(get_current_user)):
-    return user
+    result = {**user, "must_change_password": user_must_change_password(user["username"])}
+    if user.get("role") == "admin":
+        result["security_warnings"] = collect_security_warnings()
+    return result
 
 
 @router.patch("/api/auth/me")
@@ -352,6 +493,44 @@ async def api_update_me(req: SelfUserUpdateRequest, user: dict = Depends(get_cur
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/api/auth/me/tokens")
+async def api_my_tokens(user: dict = Depends(get_current_user)):
+    tokens = list_api_keys(username=user["username"])
+    return {"tokens": tokens, "count": len(tokens)}
+
+
+@router.post("/api/auth/me/tokens")
+async def api_my_create_token(req: SelfTokenCreateRequest, user: dict = Depends(get_current_user)):
+    try:
+        public_record, raw_key = create_api_key(
+            user["username"],
+            req.name,
+            expires_in_days=req.expires_in_days,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await event_bus.publish(
+        "api_token_created",
+        public_record,
+        message=f"API token created: {req.name}",
+        actor=user["username"],
+    )
+    return {**public_record, "token": raw_key}
+
+
+@router.delete("/api/auth/me/tokens/{token_id}")
+async def api_my_revoke_token(token_id: str, user: dict = Depends(get_current_user)):
+    if not revoke_api_key(token_id, username=user["username"]):
+        raise HTTPException(status_code=404, detail="Token not found")
+    await event_bus.publish(
+        "api_token_revoked",
+        {"id": token_id},
+        message="API token revoked",
+        actor=user["username"],
+    )
+    return {"success": True, "id": token_id}
 
 
 @router.get("/api/auth/me/api-keys")
@@ -435,6 +614,231 @@ async def api_user_litellm_create_key(username: str, req: AdminUserApiKeyRequest
     return data
 
 
+@router.get("/api/users/{username}/tokens")
+async def api_admin_user_tokens(username: str, _: dict = Depends(require_admin)):
+    """管理者による他ユーザーの永続APIトークン（PAT）一覧確認。"""
+    users = load_users()
+    if username not in users:
+        raise HTTPException(status_code=404, detail="User not found")
+    tokens = list_api_keys(username=username)
+    return {"tokens": tokens, "count": len(tokens)}
+
+
+@router.delete("/api/users/{username}/tokens/{token_id}")
+async def api_admin_revoke_user_token(username: str, token_id: str, admin: dict = Depends(require_admin)):
+    """管理者による他ユーザーの永続APIトークン（PAT）の強制失効。"""
+    if not revoke_api_key(token_id, username=username):
+        raise HTTPException(status_code=404, detail="Token not found")
+    await event_bus.publish(
+        "api_token_revoked",
+        {"id": token_id, "username": username},
+        message=f"管理者が {username} のAPIトークンを失効させました",
+        actor=admin["username"],
+    )
+    return {"success": True, "id": token_id, "username": username}
+
+
+def _litellm_inference_url() -> str:
+    return os.environ.get("LITELLM_INTERNAL_URL", "http://litellm:4000").rstrip("/")
+
+
+def _chat_eligible_servers(servers: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """チャット UI に載せる vLLM プロセス（embedding 除外・ポート付きのみ）。"""
+    eligible: list[dict[str, Any]] = []
+    for server in servers:
+        port = server.get("port")
+        if port is None or _is_backend_self_port(port):
+            continue
+        if str(server.get("task_type") or "chat") != "chat":
+            continue
+        eligible.append(server)
+    return eligible
+
+
+async def _chat_ui_model_ids(user: dict[str, Any]) -> list[str]:
+    username = str(user.get("username") or "")
+    chat_key = await get_or_create_chat_key(user)
+    if chat_key_allows_wildcard(username):
+        allowed = ["*"]
+    else:
+        allowed = await _allowed_models_from_litellm_key(chat_key)
+        if allowed is None:
+            raise HTTPException(status_code=401, detail="Unable to verify chat API key")
+
+    servers = list_running_servers()
+    active_servers = _chat_eligible_servers(servers)
+    status = get_status()
+    if not active_servers and (not status.get("running") or not status.get("vllm_port")):
+        return []
+    if not active_servers and status.get("running") and status.get("vllm_port"):
+        status_port = int(status["vllm_port"])
+        if not _is_backend_self_port(status_port):
+            active_servers = [
+                {
+                    "port": status_port,
+                    "model": status.get("model"),
+                    "task_type": "chat",
+                }
+            ]
+
+    try:
+        all_models = await _collect_active_vllm_models(active_servers=active_servers, status=status)
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        raise HTTPException(status_code=503, detail="vLLM upstream is unavailable")
+
+    normalized_allowed = {_normalize_model_id(m) for m in allowed if _normalize_model_id(m)}
+    model_ids: list[str] = []
+    if "*" in normalized_allowed:
+        model_ids = [str(m.get("id")) for m in all_models if m.get("id")]
+    else:
+        for entry in all_models:
+            model_id = str(entry.get("id", ""))
+            if model_id and _model_allowed_for_key(model_id, normalized_allowed):
+                model_ids.append(model_id)
+
+    if not model_ids:
+        for server in active_servers:
+            model_id = str(server.get("model") or "").strip()
+            if model_id and model_id not in model_ids:
+                model_ids.append(model_id)
+
+    if not model_ids and (all_models or active_servers):
+        return ["vllm-local"]
+    return model_ids
+
+
+async def _proxy_chat_to_litellm(
+    *,
+    chat_key: str,
+    payload: dict[str, Any],
+    stream: bool,
+) -> Response | StreamingResponse:
+    target = f"{_litellm_inference_url()}/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {chat_key}",
+        "Content-Type": "application/json",
+    }
+    body = json.dumps(payload).encode("utf-8")
+    timeout = _proxy_upstream_timeout()
+
+    if stream:
+        client = httpx.AsyncClient(timeout=timeout, trust_env=False)
+        try:
+            req = client.build_request("POST", target, content=body, headers=headers)
+            upstream = await client.send(req, stream=True)
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            with suppress(Exception):
+                await client.aclose()
+            raise HTTPException(status_code=503, detail="LiteLLM upstream is unavailable")
+
+        if upstream.status_code in {401, 403}:
+            error_body = await upstream.aread()
+            with suppress(Exception):
+                await upstream.aclose()
+            with suppress(Exception):
+                await client.aclose()
+            return Response(
+                content=error_body,
+                status_code=upstream.status_code,
+                media_type=upstream.headers.get("content-type", "application/json"),
+            )
+
+        response_headers = {}
+        for key, value in upstream.headers.items():
+            lk = key.lower()
+            if lk in {"content-length", "transfer-encoding", "connection", "content-encoding"}:
+                continue
+            response_headers[key] = value
+
+        async def _iter_upstream():
+            try:
+                async for chunk in upstream.aiter_raw():
+                    if chunk:
+                        yield chunk
+            finally:
+                with suppress(Exception):
+                    await upstream.aclose()
+                with suppress(Exception):
+                    await client.aclose()
+
+        return StreamingResponse(
+            _iter_upstream(),
+            status_code=upstream.status_code,
+            headers=response_headers,
+            media_type=upstream.headers.get("content-type"),
+        )
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+            upstream = await client.post(target, content=body, headers=headers)
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        raise HTTPException(status_code=503, detail="LiteLLM upstream is unavailable")
+
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        media_type=upstream.headers.get("content-type", "application/json"),
+    )
+
+
+@router.get("/api/chat/models")
+async def api_chat_models(user: dict = Depends(get_current_user)):
+    try:
+        models = await _chat_ui_model_ids(user)
+    except httpx.HTTPStatusError as exc:
+        detail = "チャット用 API キーの準備に失敗しました。しばらくして再試行してください。"
+        try:
+            body = exc.response.json()
+            if isinstance(body, dict) and isinstance(body.get("error"), dict):
+                msg = body["error"].get("message")
+                if isinstance(msg, str) and msg.strip():
+                    detail = msg.strip()
+        except Exception:
+            pass
+        raise HTTPException(status_code=503, detail=detail) from exc
+    return {"models": models, "count": len(models)}
+
+
+@router.post("/api/chat/completions")
+async def api_chat_completions(req: ChatUiCompletionRequest, user: dict = Depends(get_current_user)):
+    payload: dict[str, Any] = {
+        "model": req.model.strip(),
+        "messages": [{"role": m.role, "content": m.content} for m in req.messages],
+        "stream": req.stream,
+    }
+    if req.temperature is not None:
+        payload["temperature"] = req.temperature
+    if req.max_tokens is not None:
+        payload["max_tokens"] = req.max_tokens
+
+    chat_key = await get_or_create_chat_key(user)
+    result = await _proxy_chat_to_litellm(chat_key=chat_key, payload=payload, stream=req.stream)
+
+    if result.status_code in {401, 403}:
+        chat_key = await regenerate_chat_key(user)
+        result = await _proxy_chat_to_litellm(chat_key=chat_key, payload=payload, stream=req.stream)
+
+    if isinstance(result, StreamingResponse):
+        return result
+
+    if result.status_code >= 400:
+        detail = result.body.decode("utf-8", errors="replace") if result.body else result.status_code
+        try:
+            parsed = json.loads(detail)
+            if isinstance(parsed, dict) and parsed.get("error"):
+                err = parsed["error"]
+                detail = err.get("message") if isinstance(err, dict) else str(err)
+        except Exception:
+            pass
+        raise HTTPException(status_code=result.status_code, detail=detail or "Chat completion failed")
+
+    return Response(
+        content=result.body,
+        status_code=result.status_code,
+        media_type=result.media_type or "application/json",
+    )
+
+
 @router.get("/api/users")
 async def api_users(_: dict = Depends(require_admin)):
     return [public_user(user) for user in load_users().values()]
@@ -490,12 +894,21 @@ async def api_health_check(_: dict = Depends(get_current_user)):
 @router.post("/api/start", response_model=ApiResponse)
 async def api_start(req: ServerStartRequest, admin: dict = Depends(require_admin)):
     """vLLM サーバーを起動"""
-    if req.model_id not in {model["id"] for model in load_model_catalog()}:
+    catalog = {model["id"]: model for model in load_model_catalog()}
+    if req.model_id not in catalog:
         raise HTTPException(status_code=400, detail="Model must be registered before it can be started")
-    await event_bus.publish("server_job", {"status": "starting", "model_id": req.model_id}, actor=admin["username"])
+    catalog_entry = catalog[req.model_id]
+    resolved = _resolve_start_request(req, catalog_entry)
+    task_type = resolved["task_type"]
+    trust_remote_code = resolved["trust_remote_code"]
+    await event_bus.publish(
+        "server_job",
+        {"status": "starting", "model_id": req.model_id, "task_type": task_type},
+        actor=admin["username"],
+    )
     result = start_server(
         model_id=req.model_id,
-        context_length=req.context_length,
+        context_length=resolved["context_length"],
         max_num_seqs=req.max_num_seqs,
         default_max_tokens=req.default_max_tokens,
         default_temperature=req.default_temperature,
@@ -514,6 +927,11 @@ async def api_start(req: ServerStartRequest, admin: dict = Depends(require_admin
         limit_mm_per_prompt=req.limit_mm_per_prompt,
         mm_encoder_tp_mode=req.mm_encoder_tp_mode or None,
         mm_processor_cache_type=req.mm_processor_cache_type or None,
+        task_type=task_type,
+        trust_remote_code=trust_remote_code,
+        instance_id=req.instance_id,
+        instance_name=req.instance_name,
+        create_new_instance=resolved["create_new_instance"],
     )
     await event_bus.publish(
         "server_job",
@@ -536,6 +954,42 @@ async def api_stop(admin: dict = Depends(require_admin)):
 async def api_servers(_: dict = Depends(require_admin)):
     """起動中の vLLM サーバー一覧を取得"""
     return list_running_servers()
+
+
+@router.get("/api/instances")
+async def api_instances(_: dict = Depends(require_admin)):
+    """管理対象 vLLM インスタンス一覧を取得"""
+    return list_instances()
+
+
+@router.post("/api/instances/stop")
+async def api_stop_instance(req: StopInstanceRequest, admin: dict = Depends(require_admin)):
+    """指定 instance_id の vLLM サーバーを停止"""
+    result = stop_instance(req.instance_id)
+    await event_bus.publish(
+        "server_job",
+        {"status": "stopped", "result": result, "instance_id": req.instance_id},
+        message=result["message"],
+        actor=admin["username"],
+    )
+    return result
+
+
+@router.post("/api/instances/{instance_id}/smoke-test")
+async def api_instance_smoke_test(instance_id: str, admin: dict = Depends(require_admin)):
+    """稼働中インスタンスへ最小リクエストを送り、実際に応答を返せるか検証する。"""
+    result = await run_smoke_test(instance_id)
+    await event_bus.publish(
+        "instance_smoke_test",
+        result,
+        message=(
+            f"疎通テスト成功 (instance={instance_id}, {result.get('latency_ms')}ms)"
+            if result.get("success")
+            else f"疎通テスト失敗 (instance={instance_id}): {result.get('error')}"
+        ),
+        actor=admin["username"],
+    )
+    return result
 
 
 @router.post("/api/servers/stop")
@@ -573,9 +1027,9 @@ async def api_system_metrics():
 
 
 @router.get("/api/log")
-async def api_log(tail: int = 100, _: dict = Depends(require_admin)):
+async def api_log(tail: int = 100, instance_id: Optional[str] = None, _: dict = Depends(require_admin)):
     """vLLM サーバーのログを取得"""
-    return {"log": get_log_lines(tail=tail)}
+    return {"log": get_log_lines(tail=tail, instance_id=instance_id)}
 
 
 @router.get("/api/admin/litellm-proxy-requests/{track_id}")
@@ -641,6 +1095,7 @@ async def api_delete_model(model_id: str, admin: dict = Depends(require_admin)):
 
 @router.get("/api/model-downloads")
 async def api_model_downloads(_: dict = Depends(require_admin)):
+    reconcile_orphan_download_jobs(actor="system")
     return load_jobs()
 
 
@@ -657,6 +1112,15 @@ async def api_cancel_model_download(req: DownloadRequest, admin: dict = Depends(
     return await cancel_active_download_jobs(req.model_id, actor=admin["username"])
 
 
+@router.post("/api/model-downloads/resume")
+async def api_resume_model_download(req: DownloadRequest, admin: dict = Depends(require_admin)):
+    """停止・停滞したジョブをキャンセルし、キャッシュ済みバイトから続きを再開する。"""
+    try:
+        return await resume_download_job(req.model_id, actor=admin["username"])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.get("/api/context-presets")
 async def api_context_presets():
     """コンテキスト長のプリセットを取得"""
@@ -666,18 +1130,36 @@ async def api_context_presets():
 # --- WebSocket メトリクス ---
 
 @router.websocket("/ws/metrics")
-async def websocket_metrics(ws: WebSocket):
+async def websocket_metrics(ws: WebSocket, token: str | None = Query(default=None)):
     """イベント WebSocket エンドポイント（互換性のため /ws/metrics を維持）"""
+    if not token:
+        await ws.close(code=1008, reason="Authentication required")
+        return
+    try:
+        user = get_user_from_token(token)
+    except HTTPException:
+        await ws.close(code=1008, reason="Invalid or expired session")
+        return
+
     await ws.accept()
-    event_bus.register(ws)
+    event_bus.register(ws, user)
+    is_admin = user.get("role") == "admin"
 
     try:
         # 接続時に直近の履歴を送信
-        await ws.send_json({"type": "event_history", "data": event_bus.get_history(count=50)})
+        await ws.send_json(
+            {
+                "type": "event_history",
+                "data": event_bus.get_history(count=50, user=user),
+            }
+        )
         history = metrics_scraper.get_history(count=10) if metrics_scraper else []
         if history:
             await ws.send_json({"type": "history", "data": history})
-        await ws.send_json({"type": "litellm_proxy_snapshot", "data": {"requests": litellm_proxy_snapshot()}})
+        if is_admin:
+            await ws.send_json(
+                {"type": "litellm_proxy_snapshot", "data": {"requests": litellm_proxy_snapshot()}}
+            )
 
         while True:
             # クライアントからのメッセージを待機（ping 用）
@@ -755,6 +1237,12 @@ async def api_litellm_create_team(req: LiteLLMProxyRequest, admin: dict = Depend
 @router.get("/api/litellm/spend")
 async def api_litellm_spend(_: dict = Depends(require_admin)):
     return await litellm_request("GET", "/spend/logs")
+
+
+@router.get("/api/audit-log")
+async def api_audit_log(limit: int = 100, _: dict = Depends(require_admin)):
+    safe_limit = max(1, min(500, int(limit)))
+    return {"entries": read_audit_log(safe_limit), "count": safe_limit}
 
 
 app.include_router(router)
@@ -849,11 +1337,24 @@ async def _collect_active_vllm_models(
     return all_models
 
 
-def _pick_target_server(requested_model: str, servers: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+def _pick_target_server(
+    requested_model: str,
+    servers: list[dict[str, Any]],
+    *,
+    preferred_task_type: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
     normalized = _normalize_model_id(requested_model)
     candidates = [s for s in servers if s.get("port")]
     if not candidates:
         return None
+
+    if preferred_task_type:
+        typed = [
+            s for s in candidates if str(s.get("task_type") or "chat").lower() == preferred_task_type
+        ]
+        if not typed:
+            return None
+        candidates = typed
 
     if not _is_alias_model(normalized):
         for server in candidates:
@@ -871,6 +1372,17 @@ def _pick_target_server(requested_model: str, servers: list[dict[str, Any]]) -> 
     if managed:
         return managed
     return sorted(candidates, key=lambda s: int(s.get("port") or 0))[0]
+
+
+def _preferred_task_type_for_subpath(subpath: str) -> Optional[str]:
+    normalized = subpath.strip("/")
+    if normalized == "embeddings":
+        return "embedding"
+    if normalized in {"score", "rerank", "v1/score", "v1/rerank", "v2/rerank"}:
+        return "rerank"
+    if normalized in {"chat/completions", "completions", "messages"}:
+        return "chat"
+    return None
 
 
 def _is_stream_request_payload(payload: Optional[dict[str, Any]]) -> bool:
@@ -1175,13 +1687,18 @@ async def proxy_openai_compat(subpath: str, request: Request):
         except Exception:
             request_payload = None
 
-    target_server = _pick_target_server(requested_model, active_servers)
-    if target_server is None and status.get("vllm_port"):
-        target_port = int(status["vllm_port"])
-        target_model = status.get("model")
-    elif target_server is not None:
+    preferred_task = _preferred_task_type_for_subpath(subpath)
+    target_server = _pick_target_server(
+        requested_model,
+        active_servers,
+        preferred_task_type=preferred_task,
+    )
+    if target_server is not None:
         target_port = int(target_server["port"])
         target_model = target_server.get("model")
+    elif preferred_task is None and status.get("vllm_port"):
+        target_port = int(status["vllm_port"])
+        target_model = status.get("model")
     else:
         raise HTTPException(status_code=503, detail="No active vLLM server found")
 
@@ -1204,12 +1721,24 @@ async def proxy_openai_compat(subpath: str, request: Request):
         ):
             request_payload["stream"] = True
         body = json.dumps(request_payload).encode("utf-8")
+    elif request_payload is not None and subpath in {
+        "embeddings",
+        "score",
+        "rerank",
+        "v1/score",
+        "v1/rerank",
+        "v2/rerank",
+    }:
+        if target_model and _is_alias_model(_normalize_model_id(requested_model)):
+            request_payload["model"] = target_model
+            body = json.dumps(request_payload).encode("utf-8")
 
     query_items = list(request.query_params.multi_items())
     if original_subpath == "messages":
         query_items = [(k, v) for (k, v) in query_items if str(k).lower() != "beta"]
     query_string = urlencode(query_items)
-    target = f"http://127.0.0.1:{target_port}/v1/{subpath}"
+    upstream_path = getattr(request.state, "upstream_path", None) or f"/v1/{subpath}"
+    target = f"http://127.0.0.1:{target_port}{upstream_path}"
     if query_string:
         target = f"{target}?{query_string}"
     forward_headers = {}
@@ -1329,3 +1858,21 @@ async def proxy_openai_compat(subpath: str, request: Request):
         headers=response_headers,
         media_type=upstream.headers.get("content-type"),
     )
+
+
+@app.api_route("/score", methods=["POST"])
+async def proxy_score_root(request: Request):
+    request.state.upstream_path = "/score"
+    return await proxy_openai_compat("score", request)
+
+
+@app.api_route("/rerank", methods=["POST"])
+async def proxy_rerank_root(request: Request):
+    request.state.upstream_path = "/rerank"
+    return await proxy_openai_compat("rerank", request)
+
+
+@app.api_route("/v2/rerank", methods=["POST"])
+async def proxy_v2_rerank(request: Request):
+    request.state.upstream_path = "/v2/rerank"
+    return await proxy_openai_compat("v2/rerank", request)

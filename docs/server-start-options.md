@@ -5,6 +5,80 @@
 
 ---
 
+## 複数インスタンス同時起動
+
+- UI の「起動」は **既存プロセスを止めず** 新しい vLLM を追加します（`create_new_instance: true`）。
+- 各インスタンスは `instance_id` ごとに PID / ログ / 設定を `vllm-data/instances/<id>/` に保存します（legacy の default は従来どおり `config.json` / `vllm.pid`）。
+- 空きポートは起動時に自動採番されます（8001 から順に）。
+- `/v1/models` は **全稼働 vLLM のモデルを集約**して返します（LiteLLM キーのモデル許可フィルタは従来どおり）。
+
+## 埋め込みモデル（embedding）
+
+| 項目 | 内容 |
+|------|------|
+| モデル登録 | `task_type: embedding`（UI または `POST /api/models`） |
+| 推奨メタデータ | `recommended_context_length`（多くは 8192）、`output_dimension`（既知なら）、`license_note`（任意） |
+| vLLM 起動 | `vllm serve <model> --runner pooling ...` |
+| API | `POST /v1/embeddings` |
+| LiteLLM 経由 | 変更なし（`:14000/v1` → backend プロキシ → 該当 embedding インスタンス） |
+| chat 向けオプション | Speculative / Tool calling / Vision は embedding 起動時は付きません |
+
+### 登録から推論まで（汎用手順）
+
+1. **モデル管理**で Hugging Face `repo_id` を `task_type: embedding` として登録
+2. **ダウンロード**（管理者 PAT または UI）
+3. **サーバー管理**で起動（推奨コンテキスト長がフォームへ反映されます）
+4. **smoke test** で `embedding dim=N` を確認（既知次元と照合）
+5. LiteLLM キーにモデル ID を許可して `/v1/embeddings` を呼び出し
+
+CLI 例:
+
+```bash
+export VLLM_MANAGER_URL=http://hinton.kanazawa-it.ac.jp:18000
+./scripts/vllm-cli.sh models download org/your-embedding-model
+./scripts/vllm-cli.sh start org/your-embedding-model \
+  --context-length 8192 --task-type embedding --no-download
+./scripts/vllm-cli.sh smoke-test <instance_id>
+```
+
+### GPU 競合と切り替え運用
+
+大規模 chat モデル（例: Qwen 27B）と embedding を同じ GPU に常駐させると VRAM 不足になることがあります。環境によっては次のいずれかを選びます。
+
+| パターン | 内容 |
+|----------|------|
+| 切り替え | 検索時だけ chat を stop → embed を start |
+| 別 GPU | 空き GPU があれば embed を常駐 |
+| CPU | 遅いが VRAM 競合なし（vLLM 設定次第） |
+
+### 例（LiteLLM 経由）
+
+```bash
+curl http://hinton.kanazawa-it.ac.jp:14000/v1/embeddings \
+  -H "Authorization: Bearer sk-vllm-default-key" \
+  -H "Content-Type: application/json" \
+  -d '{"model":"jinaai/jina-embeddings-v3","input":"Hello"}'
+```
+
+vLLM 0.21.0 で特定モデルが起動できない場合は、起動ログを確認し、必要なら vLLM バージョン更新や `pooler_config` 対応を別タスクで検討してください。
+
+### HF キャッシュの Permission denied（ダウンロード失敗）
+
+ダウンロードジョブが `.locks` で `Permission denied` になる場合、backend の non-root 化後に root 所有のロックが残っていることがあります。
+
+```bash
+# 恒久修正を含む backend 再ビルド（HF_HOME=/app/hf-cache、起動時に .locks を修復）
+docker compose build backend && docker compose up -d backend
+
+# 緊急修復のみ（コンテナ内 root）
+docker compose exec -u root backend /app/scripts/fix-hf-cache-permissions.sh \
+  sbintuitions/sarashina-embedding-v2-1b
+```
+
+修復後に `POST /api/model-downloads` → `POST /api/start` → `/v1/embeddings` を再試行してください。
+
+---
+
 ## まず最初の推奨設定
 
 迷ったら次で開始し、必要になってから上げるのが安全です。

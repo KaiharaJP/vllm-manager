@@ -50,10 +50,11 @@ INSTANCE=$($CLI instances | jq -r '[.[] | select(.running==true)][0].instance_id
 $CLI smoke-test "$INSTANCE"
 
 SK="${LITELLM_API_KEY:-${VLLM_MANAGER_SK_KEY:-$(cat ~/.config/vllm-manager/litellm-key)}}"
-curl -sS "$LITELLM_URL/v1/chat/completions" \
+# LiteLLM chat must use stream:true (backend force-streams these requests for 504 avoidance)
+curl -sS -N "$LITELLM_URL/v1/chat/completions" \
   -H "Authorization: Bearer $SK" \
   -H "Content-Type: application/json" \
-  -d "{\"model\":\"vllm-local\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":16}"
+  -d "{\"model\":\"vllm-local\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}],\"max_tokens\":16,\"stream\":true}"
 ```
 
 ## Example 2: Embedding — register, start, call `/v1/embeddings`

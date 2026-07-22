@@ -137,10 +137,12 @@ If `task_type` omitted, catalog value is used. `embedding` / `rerank` force `cre
 | Method | Path | Auth |
 |--------|------|------|
 | GET | `/v1/models` | Bearer `sk-` |
-| POST | `/v1/chat/completions` | Bearer `sk-` |
+| POST | `/v1/chat/completions` | Bearer `sk-` — **use `"stream": true`** |
 | POST | `/v1/embeddings` | Bearer `sk-` |
 
 Aliases: `vllm-local`, `claude-vllm-local`, `*` (wildcard → backend).
+
+Chat via `:14000` is force-streamed by the Manager (`PROXY_FORCE_STREAM` / `force_stream`, 504 avoidance). Clients that send `stream: false` get SSE back and LiteLLM returns 500 (`Empty or invalid response`). Prefer `stream: true`, or call backend `:18000/v1/chat/completions` for non-stream JSON.
 
 ## CLI (`scripts/vllm-cli.sh`)
 
@@ -170,6 +172,7 @@ Environment: `VLLM_MANAGER_URL`, `VLLM_MANAGER_TOKEN`, `VLLM_MANAGER_ENV` (path 
 | 403 Admin role required | Non-admin PAT — recreate with admin |
 | 401 with `sk-` on `/api/*` | Wrong token type |
 | 401 on `:14000/v1/*` | Missing sk-; run `inference-key create --save` |
+| LiteLLM chat 500 / Empty or invalid response | Use `"stream": true` (Manager force-streams LiteLLM chat). Or hit `:18000` for non-stream |
 | 503 on `/v1/embeddings` | No embedding instance running |
 | 503 on `/v1/score` | No rerank instance running |
 | Rerank start fails for Ruri CrossEncoder | Expected — use vLLM-native models (e.g. BGE) or Phase 2 |

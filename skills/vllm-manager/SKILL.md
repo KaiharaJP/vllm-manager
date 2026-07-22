@@ -94,15 +94,16 @@ $CLI instances
 $CLI smoke-test <instance_id>
 ```
 
-Inference (LiteLLM) — use sk- from `inference-key create --save` (or `LITELLM_API_KEY`):
+Inference (LiteLLM) — use sk- from `inference-key create --save` (or `LITELLM_API_KEY`).
+**Always set `"stream": true` for chat via `:14000`** (Manager force-streams LiteLLM chat to avoid 504; non-stream clients get parse errors).
 
 ```bash
 export LITELLM_URL="${LITELLM_URL:-http://localhost:14000}"
 SK_KEY="${LITELLM_API_KEY:-${VLLM_MANAGER_SK_KEY:-$(cat ~/.config/vllm-manager/litellm-key)}}"
-curl -sS "$LITELLM_URL/v1/chat/completions" \
+curl -sS -N "$LITELLM_URL/v1/chat/completions" \
   -H "Authorization: Bearer $SK_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model":"vllm-local","messages":[{"role":"user","content":"hi"}],"max_tokens":64}'
+  -d '{"model":"vllm-local","messages":[{"role":"user","content":"hi"}],"max_tokens":64,"stream":true}'
 ```
 
 ### B. Embedding
@@ -189,7 +190,7 @@ Names containing `rerank` that were saved as embedding are auto-migrated on back
 4. **Inference via `:14000`** → `inference-key ensure` (default models=`*` all; reuses existing).
 5. Pick **task_type**: chat / embedding / rerank (never start CrossEncoder via Manager).
 6. After start → `instances` + `smoke-test` before assuming ready.
-7. Inference: chat/embeddings via `:14000` with sk-, or backend `:18000/v1/*` path routing by subpath.
+7. Inference: chat via `:14000` with sk- and **`stream: true`** (required); embeddings via `:14000` with sk-, or backend `:18000/v1/*` path routing by subpath. Non-stream chat → use `:18000` directly.
 8. Do not commit tokens (PAT file and litellm-key are separate).
 
 ## Defaults

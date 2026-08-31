@@ -223,6 +223,24 @@ $CLI storage breakdown /home/kaihara/workspace/python_env   # drill deeper
 $CLI storage usage                       # HF caches per model / Ollama / training jobs
 ```
 
+## Example 13: Minimal-VRAM startup (share a GPU without hogging it)
+
+```bash
+# chat: sized from context_length x max_num_seqs (exact --kv-cache-memory bytes)
+$CLI start Qwen/Qwen2.5-7B-Instruct --context-length 8192 --no-download \
+  --json '{"gpu_devices":"1","gpu_memory_mode":"minimal","max_num_seqs":4}'
+# -> steps report the computed KV cache GiB + utilization ceiling used
+
+# embedding/rerank: sized from model weight bytes only (no KV cache needed)
+$CLI models register jinaai/jina-embeddings-v3 --task-type embedding --context-length 8192
+$CLI start jinaai/jina-embeddings-v3 --task-type embedding --context-length 8192 --no-download \
+  --instance-name embed-minimal \
+  --json '{"gpu_devices":"1","gpu_memory_mode":"minimal"}'
+```
+
+Falls back to `auto` (with a reason in `steps`) if the model's HF config/file
+list can't be fetched — e.g. gated repo without `HF_TOKEN`, or offline.
+
 ## Token hygiene
 
 - Never commit `vlmk_` or `sk-` keys.

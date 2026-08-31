@@ -3,10 +3,11 @@ name: vllm-manager
 description: >-
   Operate vLLM Manager (start/stop chat, embedding, rerank vLLM; download models;
   smoke-test; inference via LiteLLM or backend /v1; LoRA/DPO/GRPO training jobs;
-  storage usage inspection). Use when the user mentions vllm-manager,
-  embedding/reranker startup, model download automation, admin API auth, PAT
-  tokens (vlmk_), LiteLLM sk- keys, vllm-cli, LoRA fine-tuning / RL on this
-  server, disk/SSD usage breakdown, or self-hosted LLM on :18000/:14000.
+  storage usage inspection; minimal-VRAM startup). Use when the user mentions
+  vllm-manager, embedding/reranker startup, model download automation, admin API
+  auth, PAT tokens (vlmk_), LiteLLM sk- keys, vllm-cli, LoRA fine-tuning / RL on
+  this server, disk/SSD usage breakdown, GPU memory / VRAM sizing, running
+  multiple models on one GPU, or self-hosted LLM on :18000/:14000.
 ---
 
 # vLLM Manager
@@ -219,7 +220,42 @@ UI: ストレージ tab (admin). Cold scans take minutes; results are cached
 (`--refresh` to rescan). Sizes come from a read-only host mount; nothing can be
 deleted through this API.
 
-### I. Fix wrong task_type
+### I. Minimal-VRAM startup (`gpu_memory_mode=minimal`)
+
+Default `gpu_memory_mode=auto` **maximizes** usage — it grabs whatever VRAM is
+free at start time, up to 85% of total GPU memory, regardless of how big the
+model actually is. Use when you want several models (or a model + a training
+job) to share one GPU without one of them hogging all free VRAM:
+
+```bash
+$CLI start Qwen/Qwen2.5-7B-Instruct --context-length 8192 \
+  --json '{"gpu_devices":"1","gpu_memory_mode":"minimal","max_num_seqs":4}'
+# steps in the response report the computed KV cache size + utilization ceiling
+```
+
+How it sizes VRAM (no manual percentage guessing needed):
+
+- **chat**: weight size (from HF file listing) + KV cache sized for
+  `context_length × max_num_seqs` (via vLLM's `--kv-cache-memory`, exact bytes)
+  + ~15% margin. Measured example: 9B FP8 model, ctx=8192, 4 concurrent →
+  **16.5 GB** total (vs. ~80 GB+ under `auto` on a mostly-free GPU).
+- **embedding/rerank** (pooling runner): vLLM doesn't really use a KV cache
+  for pooling, so this sizes from **model weight bytes only** — no
+  `--kv-cache-memory` is passed. Measured: `BAAI/bge-m3` → ~2.1 GB (≈ its
+  weight size almost exactly).
+- If model config/weights can't be resolved (network issue, gated repo),
+  falls back to `auto` and reports why in the start response `steps`.
+
+Trade-off to explain if asked "why not always minimal": `minimal`'s KV cache
+is sized to exactly what you requested (`context_length × max_num_seqs`) —
+concurrent requests beyond that queue or get rejected instead of using spare
+GPU headroom. Use `auto`/`manual` with a generous utilization for a model
+taking real production traffic; use `minimal` for models that should coexist
+with others or see light/bursty traffic.
+
+UI: サーバー管理 start form → GPU メモリ利用率 → 「最低限」 radio.
+
+### J. Fix wrong task_type
 
 UI: モデル管理 → 各カードの「用途」セレクト。  
 CLI: re-register with the correct `--task-type` (upsert).
@@ -242,7 +278,8 @@ Names containing `rerank` that were saved as embedding are auto-migrated on back
 8. Prefer a **concrete model id** over `vllm-local` when multiple chat models run; same model on 2 GPUs load-balances automatically.
 9. On multi-GPU hosts pass explicit `gpu_devices` at start (`"all"` grabs GPU 0 and may OOM).
 10. Training / storage ops → admin PAT + `training ...` / `storage ...` CLI commands (or `/api/training/*`, `/api/storage*`).
-11. Do not commit tokens (PAT file and litellm-key are separate).
+11. Want a model to coexist with others on a GPU (not hog it) → `gpu_memory_mode: "minimal"` in `--json` at start, not manual utilization guessing.
+12. Do not commit tokens (PAT file and litellm-key are separate).
 
 ## Defaults
 

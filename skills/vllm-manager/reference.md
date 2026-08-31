@@ -132,7 +132,17 @@ Training details (dataset formats, hyperparams, GRPO rewards): repo `docs/traini
 
 If `task_type` omitted, catalog value is used. `embedding` / `rerank` force `create_new_instance` and default context 8192 when unset.
 
-Additional chat fields: `gpu_devices` (`"1"` etc.; prefer explicit on multi-GPU hosts — `"all"` may grab a full GPU 0), `enable_lora` + optional `max_lora_rank` (allow runtime `/v1/load_lora_adapter` for training deploy).
+Additional fields: `gpu_devices` (`"1"` etc.; prefer explicit on multi-GPU hosts — `"all"` may grab a full GPU 0), `enable_lora` + optional `max_lora_rank` (allow runtime `/v1/load_lora_adapter` for training deploy), `gpu_memory_mode` (`auto` | `manual` | `minimal`, see below).
+
+### `gpu_memory_mode` values
+
+| Value | Behavior |
+|-------|----------|
+| `auto` (default) | Grabs free VRAM up to 85% of total, regardless of model size. Maximizes throughput for one dominant model on a GPU. |
+| `manual` | You set `gpu_memory_utilization` (0.1–0.85) directly. |
+| `minimal` | Sizes to what the model + your `context_length`/`max_num_seqs` actually need, via vLLM's `--kv-cache-memory` (exact bytes) for `chat`, or weight-size-only for `embedding`/`rerank` (pooling doesn't really use a KV cache). Falls back to `auto` if model config/weights can't be resolved (reported in start response `steps`). Use to co-locate multiple models/training jobs on one GPU. |
+
+Measured: 9B FP8 chat model, ctx=8192, 4 concurrent → 16.5 GB under `minimal` vs. 80+ GB under `auto` on a mostly-free GPU. `BAAI/bge-m3` embedding → ~2.1 GB under `minimal` (≈ its own weight size).
 
 ## Inference paths (backend proxy `:18000`)
 

@@ -182,6 +182,47 @@ ID=$($CLI instances | jq -r --arg m "$MODEL" \
 $CLI smoke-test "$ID"
 ```
 
+## Example 10: LoRA SFT → deploy → inference (all HTTP)
+
+```bash
+# dataset: JSONL of {"messages":[{"role":"user",...},{"role":"assistant",...}]}
+$CLI training upload sft_data.jsonl
+$CLI training submit --method sft --base-model Qwen/Qwen3.5-9B-Instruct \
+  --dataset sft_data.jsonl --gpu 1 \
+  --json '{"hyperparams":{"epochs":2,"lora_r":16,"max_seq_len":2048}}'
+$CLI training jobs                       # wait for status=completed
+JOB=<job_id>
+
+# vLLM with runtime-LoRA enabled, then hot-load the adapter
+$CLI start Qwen/Qwen3.5-9B-Instruct --json '{"enable_lora":true,"gpu_devices":"1"}'
+PORT=$($CLI instances | jq -r '.[] | select(.running==true and (.model|contains("Qwen3.5-9B"))) | .vllm_port' | head -1)
+$CLI training deploy "$JOB" --port "$PORT" --name my-adapter
+
+curl -sS "$VLLM_MANAGER_URL/v1/chat/completions" -H "Content-Type: application/json" \
+  -d '{"model":"my-adapter","messages":[{"role":"user","content":"hi"}]}'
+```
+
+## Example 11: GRPO (RL) with exact-match reward
+
+```bash
+# dataset rows: {"prompt": "...", "answer": "42"}
+$CLI training upload math.jsonl
+$CLI training submit --method grpo --base-model Qwen/Qwen3.5-9B-Instruct \
+  --dataset math.jsonl --gpu 1 \
+  --json '{"reward":{"type":"exact_match"},"hyperparams":{"num_generations":4}}'
+# remote reward server instead: {"reward":{"type":"remote","url":"http://host:9000/reward"}}
+# (POST {prompts, completions} -> {"rewards": [...]})
+```
+
+## Example 12: Storage — find what fills the SSDs
+
+```bash
+$CLI storage                             # NVMe vs SATA: used/free
+$CLI storage breakdown /home             # biggest dirs on the SATA SSD
+$CLI storage breakdown /home/kaihara/workspace/python_env   # drill deeper
+$CLI storage usage                       # HF caches per model / Ollama / training jobs
+```
+
 ## Token hygiene
 
 - Never commit `vlmk_` or `sk-` keys.

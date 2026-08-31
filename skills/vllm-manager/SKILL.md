@@ -2,10 +2,11 @@
 name: vllm-manager
 description: >-
   Operate vLLM Manager (start/stop chat, embedding, rerank vLLM; download models;
-  smoke-test; inference via LiteLLM or backend /v1). Use when the user mentions
-  vllm-manager, embedding/reranker startup, model download automation, admin API
-  auth, PAT tokens (vlmk_), LiteLLM sk- keys, vllm-cli, or self-hosted LLM on
-  :18000/:14000.
+  smoke-test; inference via LiteLLM or backend /v1; LoRA/DPO/GRPO training jobs;
+  storage usage inspection). Use when the user mentions vllm-manager,
+  embedding/reranker startup, model download automation, admin API auth, PAT
+  tokens (vlmk_), LiteLLM sk- keys, vllm-cli, LoRA fine-tuning / RL on this
+  server, disk/SSD usage breakdown, or self-hosted LLM on :18000/:14000.
 ---
 
 # vLLM Manager
@@ -171,7 +172,54 @@ $CLI stop             # stop default instance only
 
 VRAM tip: do not keep a large chat model and embedding/rerank on the same GPU unless capacity allows. Stop chat first if needed.
 
-### F. Fix wrong task_type
+### F. Model-name routing / multi-GPU load balancing
+
+`:14000` chat passes the real model id through to the backend. Prefer a concrete
+model id over `vllm-local` when multiple chat models run:
+
+```bash
+curl -sS -N "$LITELLM_URL/v1/chat/completions" \
+  -H "Authorization: Bearer $SK_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"Qwen/Qwen3.8-27B-FP8","messages":[{"role":"user","content":"hi"}],"stream":true}'
+```
+
+Same model started on multiple GPUs (same model_id, different `gpu_devices`)
+→ requests **round-robin** across instances automatically. On multi-GPU hosts
+always pass explicit `--json '{"gpu_devices":"1"}'` (or UI setting) at start;
+`"all"` tends to grab GPU 0 and fail when it is occupied.
+
+### G. Training jobs (LoRA SFT / DPO / GRPO) — HTTP only
+
+```bash
+$CLI training upload my_data.jsonl
+$CLI training submit --method sft --base-model Qwen/Qwen3.5-9B-Instruct \
+  --dataset my_data.jsonl --gpu 1
+$CLI training jobs                      # status/progress/loss
+$CLI training log <job_id> --tail 50
+# Serve the result without restart:
+$CLI start Qwen/Qwen3.5-9B-Instruct --json '{"enable_lora":true,"gpu_devices":"1"}'
+$CLI training deploy <job_id> --port <vllm_port> --name my-adapter
+# → inference with "model": "my-adapter"
+```
+
+Rules: 1 job at a time; `--gpu` explicit (checked against free VRAM);
+base = **non-quantized** model (not `*-FP8`) with 4bit QLoRA. GRPO needs
+`--json '{"reward":{"type":"exact_match"}}'` (or `contains` / `remote` with url).
+Dataset formats + hyperparams: repo `docs/training-api.md`.
+
+### H. Storage usage (SSD 内訳)
+
+```bash
+$CLI storage                            # both drives: used/free
+$CLI storage usage                      # HF caches per model, Ollama, training jobs
+$CLI storage breakdown /home            # directory sizes; drill by repeating with deeper path
+```
+
+UI: ストレージ tab (admin). Cold scans take minutes; results are cached
+(`--refresh` to rescan). Sizes come from a read-only host mount; nothing can be
+deleted through this API.
+
+### I. Fix wrong task_type
 
 UI: モデル管理 → 各カードの「用途」セレクト。  
 CLI: re-register with the correct `--task-type` (upsert).
@@ -191,7 +239,10 @@ Names containing `rerank` that were saved as embedding are auto-migrated on back
 5. Pick **task_type**: chat / embedding / rerank (never start CrossEncoder via Manager).
 6. After start → `instances` + `smoke-test` before assuming ready.
 7. Inference: chat via `:14000` with sk- and **`stream: true`** (required); embeddings via `:14000` with sk-, or backend `:18000/v1/*` path routing by subpath. Non-stream chat → use `:18000` directly.
-8. Do not commit tokens (PAT file and litellm-key are separate).
+8. Prefer a **concrete model id** over `vllm-local` when multiple chat models run; same model on 2 GPUs load-balances automatically.
+9. On multi-GPU hosts pass explicit `gpu_devices` at start (`"all"` grabs GPU 0 and may OOM).
+10. Training / storage ops → admin PAT + `training ...` / `storage ...` CLI commands (or `/api/training/*`, `/api/storage*`).
+11. Do not commit tokens (PAT file and litellm-key are separate).
 
 ## Defaults
 

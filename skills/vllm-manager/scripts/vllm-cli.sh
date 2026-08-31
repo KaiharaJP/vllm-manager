@@ -228,6 +228,26 @@ Commands:
   inference-key list                  List your LiteLLM keys
   inference-key delete --key <id>     Delete LiteLLM key (admin PAT required)
   inference-key show                  Print saved/env inference key path status
+  storage [overview]                  Drive usage summary (admin PAT)
+  storage usage [--refresh]           Per-model / per-job breakdown (HF cache, Ollama, training)
+  storage breakdown <path> [--refresh]  Directory size breakdown (host paths like /home)
+  training jobs                       List training jobs (LoRA SFT / DPO / GRPO)
+  training job <id>                   Job detail + recent log
+  training log <id> [--tail N]        Full training log tail
+  training submit [options]           Submit training job (see below)
+  training cancel <id>                Cancel a running job
+  training datasets                   List uploaded datasets
+  training upload <file.jsonl>        Upload a JSONL dataset
+  training deploy <id> --port <p> --name <n>  Hot-load finished LoRA into running vLLM
+
+Training submit options:
+  --method <sft|dpo|grpo>             Required
+  --base-model <hf_id>                Required (use non-quantized base, not *-FP8)
+  --dataset <name.jsonl|hf_id>        Required (uploaded name or HF dataset id)
+  --gpu <'1'|'0,1'>                   Required (explicit; 'all' rejected)
+  --quantization <4bit|8bit|none>     Default 4bit (QLoRA)
+  --name <job_name>                   Optional display name
+  --json '<json>'                     Extra fields (hyperparams, reward, min_free_gb)
 
 Start options:
   --context-length <n>                Context length (default: 131072 chat / 8192 pooling)
@@ -802,6 +822,123 @@ cmd_inference_key_show() {
   fi
 }
 
+urlencode() {
+  jq -rn --arg v "$1" '$v|@uri'
+}
+
+cmd_storage() {
+  local sub="${1:-overview}"
+  shift || true
+  case "$sub" in
+    overview|"")
+      api_request GET "/api/storage" | jq .
+      ;;
+    usage)
+      local refresh="false"
+      [[ "${1:-}" == "--refresh" ]] && refresh="true"
+      api_request GET "/api/storage/usage?refresh=${refresh}" | jq .
+      ;;
+    breakdown)
+      local path="${1:-}"
+      shift || true
+      [[ -n "$path" ]] || die "Usage: storage breakdown <path> [--refresh]"
+      local refresh="false"
+      [[ "${1:-}" == "--refresh" ]] && refresh="true"
+      api_request GET "/api/storage/breakdown?path=$(urlencode "$path")&refresh=${refresh}&top=60&timeout_sec=600" | jq .
+      ;;
+    *)
+      die "Unknown storage subcommand: ${sub}. Use: overview | usage [--refresh] | breakdown <path> [--refresh]"
+      ;;
+  esac
+}
+
+cmd_training_submit() {
+  local method="" base_model="" dataset="" gpu="" quant="4bit" name="" extra="{}"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --method) method="$2"; shift 2 ;;
+      --base-model) base_model="$2"; shift 2 ;;
+      --dataset) dataset="$2"; shift 2 ;;
+      --gpu) gpu="$2"; shift 2 ;;
+      --quantization) quant="$2"; shift 2 ;;
+      --name) name="$2"; shift 2 ;;
+      --json) extra="$2"; shift 2 ;;
+      *) die "Unknown option: $1" ;;
+    esac
+  done
+  [[ -n "$method" && -n "$base_model" && -n "$dataset" && -n "$gpu" ]] \
+    || die "Usage: training submit --method <sft|dpo|grpo> --base-model <id> --dataset <name.jsonl|hf-id> --gpu <'1'|'0,1'> [--quantization 4bit] [--name <job_name>] [--json '<extra>']"
+  local body
+  body="$(jq -n \
+    --arg method "$method" --arg base "$base_model" --arg ds "$dataset" \
+    --arg gpu "$gpu" --arg quant "$quant" --arg name "$name" --argjson extra "$extra" \
+    '{method: $method, base_model: $base, dataset: $ds, gpu_devices: $gpu, quantization: $quant}
+     + (if $name != "" then {job_name: $name} else {} end) + $extra')"
+  api_request POST "/api/training/jobs" "$body" | jq .
+}
+
+cmd_training() {
+  local sub="${1:-jobs}"
+  shift || true
+  case "$sub" in
+    jobs|"")
+      api_request GET "/api/training/jobs" | jq .
+      ;;
+    job)
+      local id="${1:-}"
+      [[ -n "$id" ]] || die "Usage: training job <job_id>"
+      api_request GET "/api/training/jobs/${id}?log_tail=30" | jq .
+      ;;
+    log)
+      local id="${1:-}"
+      shift || true
+      [[ -n "$id" ]] || die "Usage: training log <job_id> [--tail N]"
+      local tail_n=200
+      [[ "${1:-}" == "--tail" ]] && tail_n="${2:-200}"
+      api_request GET "/api/training/jobs/${id}/log?tail=${tail_n}" | jq -r '.log[]'
+      ;;
+    submit)
+      cmd_training_submit "$@"
+      ;;
+    cancel)
+      local id="${1:-}"
+      [[ -n "$id" ]] || die "Usage: training cancel <job_id>"
+      api_request POST "/api/training/jobs/${id}/cancel" "{}" | jq .
+      ;;
+    datasets)
+      api_request GET "/api/training/datasets" | jq .
+      ;;
+    upload)
+      local file="${1:-}"
+      [[ -n "$file" && -f "$file" ]] || die "Usage: training upload <file.jsonl>"
+      local token
+      token="$(load_token)" || die "No token found. Run: $0 token create --name <name>"
+      curl -sS -X POST "${BASE_URL}/api/training/datasets" \
+        -H "Authorization: Bearer ${token}" \
+        -F "file=@${file}" | jq .
+      ;;
+    deploy)
+      local id="" port="" lora_name=""
+      id="${1:-}"
+      shift || true
+      [[ -n "$id" ]] || die "Usage: training deploy <job_id> --port <vllm_port> --name <lora_name>"
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --port) port="$2"; shift 2 ;;
+          --name) lora_name="$2"; shift 2 ;;
+          *) die "Unknown option: $1" ;;
+        esac
+      done
+      [[ -n "$port" && -n "$lora_name" ]] || die "Usage: training deploy <job_id> --port <vllm_port> --name <lora_name>"
+      api_request POST "/api/training/jobs/${id}/deploy" \
+        "$(jq -n --argjson port "$port" --arg name "$lora_name" '{port: $port, lora_name: $name}')" | jq .
+      ;;
+    *)
+      die "Unknown training subcommand: ${sub}. Use: jobs | job <id> | log <id> | submit | cancel <id> | datasets | upload <file> | deploy <id>"
+      ;;
+  esac
+}
+
 main() {
   need_cmd curl
   need_cmd jq
@@ -899,6 +1036,12 @@ main() {
           die "Unknown inference-key subcommand: ${sub:-<none>}. Use: create | ensure | list | delete | show"
           ;;
       esac
+      ;;
+    storage)
+      cmd_storage "$@"
+      ;;
+    training)
+      cmd_training "$@"
       ;;
     help|-h|--help|"")
       usage

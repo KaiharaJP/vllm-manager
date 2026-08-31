@@ -105,6 +105,17 @@ Also available in UI (マイページ / ユーザ管理) and `POST /api/auth/me/
 | GET | `/api/model-downloads` | admin | List jobs (also reconciles orphans) |
 | POST | `/api/model-downloads/resume` | admin | Resume from HF cache |
 | POST | `/api/model-downloads/cancel` | admin | Cancel active jobs |
+| GET | `/api/storage` | admin | Drive usage summary (NVMe / SATA, instant) |
+| GET | `/api/storage/usage` | admin | Per-model (HF caches), Ollama, per-job sizes; `?refresh=true` rescans |
+| GET | `/api/storage/breakdown` | admin | `?path=/home&top=60` directory sizes (du, cached; minutes on cold scan) |
+| POST | `/api/training/datasets` | admin | Upload JSONL dataset (multipart `file=`) |
+| GET | `/api/training/datasets` | admin | List uploaded datasets |
+| POST | `/api/training/jobs` | admin | Submit LoRA SFT / DPO / GRPO job (1 concurrent max) |
+| GET | `/api/training/jobs` / `/{id}` / `/{id}/log` | admin | List / detail (`?log_tail=N`) / log |
+| POST | `/api/training/jobs/{id}/cancel` | admin | Cancel running job |
+| POST | `/api/training/jobs/{id}/deploy` | admin | Hot-load adapter: `{port, lora_name}` (target needs `enable_lora`) |
+
+Training details (dataset formats, hyperparams, GRPO rewards): repo `docs/training-api.md`.
 
 ### `POST /api/start` body (important fields)
 
@@ -121,6 +132,8 @@ Also available in UI (マイページ / ユーザ管理) and `POST /api/auth/me/
 
 If `task_type` omitted, catalog value is used. `embedding` / `rerank` force `create_new_instance` and default context 8192 when unset.
 
+Additional chat fields: `gpu_devices` (`"1"` etc.; prefer explicit on multi-GPU hosts — `"all"` may grab a full GPU 0), `enable_lora` + optional `max_lora_rank` (allow runtime `/v1/load_lora_adapter` for training deploy).
+
 ## Inference paths (backend proxy `:18000`)
 
 | Client path | Preferred instance |
@@ -132,6 +145,8 @@ If `task_type` omitted, catalog value is used. `embedding` / `rerank` force `cre
 
 503 if no matching running instance.
 
+**Model-name routing + round-robin:** when the request `model` matches a running instance's model id (exact, or basename match), that instance is used. If the **same model runs on multiple instances** (e.g. GPU0 and GPU1), requests round-robin across them. Aliases (`vllm-local` etc.) skip name matching and go to the first managed chat instance.
+
 ## Inference API (LiteLLM `:14000`)
 
 | Method | Path | Auth |
@@ -140,7 +155,7 @@ If `task_type` omitted, catalog value is used. `embedding` / `rerank` force `cre
 | POST | `/v1/chat/completions` | Bearer `sk-` — **use `"stream": true`** |
 | POST | `/v1/embeddings` | Bearer `sk-` |
 
-Aliases: `vllm-local`, `claude-vllm-local`, `*` (wildcard → backend).
+Aliases: `vllm-local`, `claude-vllm-local` (→ first managed chat instance). The `*` wildcard now **passes the requested model name through** to the backend (`litellm_params.model: openai/*`), so specifying a real model id (e.g. `Qwen/Qwen3.8-27B-FP8`) routes to that instance — and load-balances round-robin when the same model runs on multiple GPUs.
 
 Chat via `:14000` is force-streamed by the Manager (`PROXY_FORCE_STREAM` / `force_stream`, 504 avoidance). Clients that send `stream: false` get SSE back and LiteLLM returns 500 (`Empty or invalid response`). Prefer `stream: true`, or call backend `:18000/v1/chat/completions` for non-stream JSON.
 
@@ -160,6 +175,8 @@ Chat via `:14000` is force-streamed by the Manager (`PROXY_FORCE_STREAM` / `forc
 | `token create\|list\|revoke` | login / PAT | Management PAT (`vlmk_`) |
 | `inference-key create\|list\|show` | PAT | LiteLLM sk-; `--save` → `litellm-key` file |
 | `inference-key delete --key` | admin PAT | Deletes via LiteLLM `/key/delete` |
+| `storage [overview\|usage\|breakdown <path>]` | admin PAT | Drive / per-model / directory sizes |
+| `training jobs\|job\|log\|submit\|cancel\|datasets\|upload\|deploy` | admin PAT | LoRA SFT / DPO / GRPO jobs |
 
 Environment: `VLLM_MANAGER_URL`, `VLLM_MANAGER_TOKEN`, `VLLM_MANAGER_ENV` (path to `.env`), `VLLM_MANAGER_CONFIG`, `LITELLM_API_KEY` / `VLLM_MANAGER_SK_KEY`.  
 `token create` credentials: flags → `VLLM_MANAGER_USERNAME`/`PASSWORD` → `.env` `VLLM_MANAGER_ADMIN_USER`/`PASSWORD`.

@@ -766,10 +766,16 @@ export default function ServerControl({
         {/* GPU メモリ利用率 */}
         <div className="mb-4">
           <FieldLabel
-            label={`GPU メモリ利用率: ${form.gpu_memory_mode === "auto" ? "自動" : `${Math.round(form.gpu_memory_utilization * 100)}%`}`}
-            hint="vLLM の `--gpu-memory-utilization` に対応します。GPU 全体 VRAM に対して「KV キャッシュ等に使ってよい上限比率」のイメージです。高いほど長いコンテキストや同時 seq を取りやすい一方、空きが少ないと起動失敗や他プロセスとの競合が起きやすくなります。自動は空き VRAM から算出します。"
+            label={`GPU メモリ利用率: ${
+              form.gpu_memory_mode === "auto"
+                ? "自動（空きを最大確保）"
+                : form.gpu_memory_mode === "minimal"
+                  ? "最低限（他プロセスと同居しやすい）"
+                  : `${Math.round(form.gpu_memory_utilization * 100)}%`
+            }`}
+            hint="vLLM の `--gpu-memory-utilization` に対応します。GPU 全体 VRAM に対して「KV キャッシュ等に使ってよい上限比率」のイメージです。自動はその時点の空き VRAM を目一杯（上限85%まで）確保します。最低限は指定した context 長 × 同時実行数に必要な分だけ確保するので、同じ GPU に他のモデルや学習ジョブを同居させたいときに有効です。"
           />
-          <div className="flex gap-4 text-sm mb-2">
+          <div className="flex gap-4 text-sm mb-2 flex-wrap">
             <label className="flex items-center gap-2">
               <input
                 type="radio"
@@ -784,6 +790,16 @@ export default function ServerControl({
               <input
                 type="radio"
                 name="gpu_memory_mode"
+                checked={form.gpu_memory_mode === "minimal"}
+                onChange={() => setForm({ ...form, gpu_memory_mode: "minimal" })}
+                disabled={isBusy}
+              />
+              最低限
+            </label>
+            <label className="flex items-center gap-2">
+              <input
+                type="radio"
+                name="gpu_memory_mode"
                 checked={form.gpu_memory_mode === "manual"}
                 onChange={() => setForm({ ...form, gpu_memory_mode: "manual" })}
                 disabled={isBusy}
@@ -791,6 +807,12 @@ export default function ServerControl({
               手動
             </label>
           </div>
+          {form.gpu_memory_mode === "minimal" && (
+            <p className="mt-1 mb-2 text-xs text-gray-500">
+              現在の設定（コンテキスト長 × 最大同時実行数）から必要な KV キャッシュ量を見積もって起動します。
+              モデル設定の取得に失敗した場合は自動モードにフォールバックします。
+            </p>
+          )}
           {form.gpu_memory_mode === "manual" ? (
             <>
               <NumberSliderField

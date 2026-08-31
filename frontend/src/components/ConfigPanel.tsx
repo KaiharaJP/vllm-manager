@@ -70,8 +70,14 @@ export default function ConfigPanel({ config, models, contextPresets }: ConfigPa
             />
             <ConfigRow
               label="GPU メモリ設定モード"
-              value={config.gpu_memory_mode === "auto" ? "自動" : "手動"}
-              hint="自動時は起動前に空き VRAM から利用率を推定します。"
+              value={
+                config.gpu_memory_mode === "auto"
+                  ? "自動"
+                  : config.gpu_memory_mode === "minimal"
+                    ? "最低限"
+                    : "手動"
+              }
+              hint="自動=空きVRAMを最大確保 / 最低限=context長×同時実行数から必要分のみ確保 / 手動=固定割合"
             />
             <ConfigRow
               label="GPU メモリ利用率"

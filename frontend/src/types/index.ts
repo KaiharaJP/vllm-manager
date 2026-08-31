@@ -70,7 +70,7 @@ export interface ServerConfig {
   default_top_p: number;
   default_frequency_penalty: number;
   default_presence_penalty: number;
-  gpu_memory_mode: "auto" | "manual";
+  gpu_memory_mode: "auto" | "manual" | "minimal";
   gpu_memory_utilization: number;
   tensor_parallel_size: number;
   gpu_devices: string;
@@ -111,7 +111,7 @@ export interface ServerStartRequest {
   default_top_p: number;
   default_frequency_penalty: number;
   default_presence_penalty: number;
-  gpu_memory_mode: "auto" | "manual";
+  gpu_memory_mode: "auto" | "manual" | "minimal";
   gpu_memory_utilization: number;
   tensor_parallel_size: number;
   gpu_devices: string;

@@ -656,6 +656,12 @@ def _build_command(config: dict) -> list:
         if tcp:
             cmd.extend(["--enable-auto-tool-choice", "--tool-call-parser", tcp])
 
+    if config.get("enable_lora"):
+        cmd.append("--enable-lora")
+        max_rank = config.get("max_lora_rank")
+        if max_rank:
+            cmd.extend(["--max-lora-rank", str(int(max_rank))])
+
     limit_mm = _resolve_limit_mm_for_config(config)
     if limit_mm is not None:
         cmd.extend(
@@ -859,6 +865,9 @@ def _vllm_subprocess_env(config: dict) -> dict[str, str]:
     devices = str(config.get("gpu_devices", "all")).strip()
     if devices and devices.lower() != "all":
         env["CUDA_VISIBLE_DEVICES"] = devices
+    if config.get("enable_lora"):
+        # /v1/load_lora_adapter による実行時アダプタ追加を許可する
+        env["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "1"
     return env
 
 
@@ -939,6 +948,8 @@ def start_server(
     mm_processor_cache_type: Optional[str] = None,
     task_type: Optional[str] = None,
     trust_remote_code: Optional[bool] = None,
+    enable_lora: Optional[bool] = None,
+    max_lora_rank: Optional[int] = None,
     instance_id: Optional[str] = None,
     instance_name: Optional[str] = None,
     create_new_instance: bool = False,
@@ -997,6 +1008,10 @@ def start_server(
         config["task_type"] = _normalize_task_type(task_type)
     if trust_remote_code is not None:
         config["trust_remote_code"] = bool(trust_remote_code)
+    if enable_lora is not None:
+        config["enable_lora"] = bool(enable_lora)
+    if max_lora_rank is not None:
+        config["max_lora_rank"] = max(8, min(512, int(max_lora_rank)))
 
     config["task_type"] = _normalize_task_type(config.get("task_type"))
     if create_new_instance or instance_id or instance_name:
@@ -1241,6 +1256,8 @@ def _config_start_kwargs(config: dict[str, Any]) -> dict[str, Any]:
         "mm_processor_cache_type",
         "task_type",
         "trust_remote_code",
+        "enable_lora",
+        "max_lora_rank",
     )
     return {k: config[k] for k in keys if k in config}
 
@@ -1311,6 +1328,8 @@ def restart_server(instance_id: Optional[str] = None) -> dict:
                 "mm_processor_cache_type",
                 "task_type",
                 "trust_remote_code",
+                "enable_lora",
+                "max_lora_rank",
             )
             if k in config
         },

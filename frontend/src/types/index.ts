@@ -374,3 +374,53 @@ export interface SystemMetrics {
   gpus: SystemGpuMetrics[];
   gpu_processes: GpuProcessMetrics[];
 }
+
+// --- ストレージ使用状況 ---
+
+export interface StorageMount {
+  label: string;
+  path: string;
+  total_gb: number;
+  used_gb: number;
+  free_gb: number;
+  used_percent: number | null;
+  same_device_as_above: boolean;
+}
+
+export interface StorageBreakdownEntry {
+  path: string;
+  size_gb: number;
+}
+
+export interface StorageBreakdown {
+  success: boolean;
+  path: string;
+  total_gb: number | null;
+  entries: StorageBreakdownEntry[];
+  entries_omitted: number;
+  scanned_at: number;
+  warnings: string[];
+  cached?: boolean;
+  age_sec?: number;
+}
+
+export interface StorageUsageItem {
+  name: string;
+  size_gb: number;
+}
+
+export interface StorageUsageSection {
+  category: string;
+  path: string;
+  total_gb: number | null;
+  items: StorageUsageItem[];
+  note?: string;
+}
+
+export interface StorageUsageReport {
+  success: boolean;
+  sections: StorageUsageSection[];
+  scanned_at: number;
+  cached?: boolean;
+  age_sec?: number;
+}

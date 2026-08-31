@@ -11,6 +11,7 @@ import ModelManagement from "@/components/ModelManagement";
 import LiteLLMAdminPanel from "@/components/LiteLLMAdminPanel";
 import UserManagementPanel from "@/components/UserManagementPanel";
 import UsagePanel from "@/components/UsagePanel";
+import StoragePanel from "@/components/StoragePanel";
 import SystemOverview from "@/components/SystemOverview";
 import ChatPanel from "@/components/ChatPanel";
 import { api } from "@/lib/api";
@@ -21,7 +22,7 @@ interface DashboardProps {
   onLogout: () => void;
 }
 
-type TabKey = "overview" | "chat" | "control" | "metrics" | "requestHistory" | "models" | "users" | "litellm" | "usage" | "config" | "log";
+type TabKey = "overview" | "chat" | "control" | "metrics" | "requestHistory" | "models" | "users" | "litellm" | "usage" | "storage" | "config" | "log";
 const TAB_STORAGE_KEY = "vllm_manager_active_tab";
 
 export default function Dashboard({ currentUser, onLogout }: DashboardProps) {
@@ -39,7 +40,7 @@ export default function Dashboard({ currentUser, onLogout }: DashboardProps) {
     const saved = window.localStorage.getItem(TAB_STORAGE_KEY) as TabKey | null;
     if (!saved) return;
     const allowedTabs: TabKey[] = currentUser.role === "admin"
-      ? ["overview", "chat", "control", "metrics", "requestHistory", "models", "users", "litellm", "usage", "config", "log"]
+      ? ["overview", "chat", "control", "metrics", "requestHistory", "models", "users", "litellm", "usage", "storage", "config", "log"]
       : ["overview", "chat", "metrics", "users"];
     setActiveTab(allowedTabs.includes(saved) ? saved : "overview");
   }, [currentUser.role]);
@@ -165,6 +166,7 @@ export default function Dashboard({ currentUser, onLogout }: DashboardProps) {
                 { key: "users", label: "ユーザー管理" },
                 { key: "litellm", label: "APIキー/チーム" },
                 { key: "usage", label: "利用状況" },
+                { key: "storage", label: "ストレージ" },
                 { key: "config", label: "設定" },
                 { key: "log", label: "ログ" },
               ] as const : []),
@@ -208,6 +210,7 @@ export default function Dashboard({ currentUser, onLogout }: DashboardProps) {
         {activeTab === "users" && <UserManagementPanel currentUser={currentUser} />}
         {activeTab === "litellm" && currentUser.role === "admin" && <LiteLLMAdminPanel />}
         {activeTab === "usage" && currentUser.role === "admin" && <UsagePanel />}
+        {activeTab === "storage" && currentUser.role === "admin" && <StoragePanel />}
         {activeTab === "config" && currentUser.role === "admin" && (
           <ConfigPanel
             config={config}

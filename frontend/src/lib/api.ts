@@ -44,12 +44,12 @@ function getToken(): string | null {
   return window.localStorage.getItem("vllm_manager_token");
 }
 
-async function request<T>(path: string, options?: RequestInit): Promise<T> {
+async function request<T>(path: string, options?: RequestInit, deadlineMs: number = REQUEST_DEADLINE_MS): Promise<T> {
   const url = API_BASE ? `${API_BASE}${path}` : path;
   const backendLabel = API_BASE || "同一オリジン (/api 経由)";
   const token = getToken();
   const deadlineCtrl = new AbortController();
-  const deadlineTimer = setTimeout(() => deadlineCtrl.abort(), REQUEST_DEADLINE_MS);
+  const deadlineTimer = setTimeout(() => deadlineCtrl.abort(), deadlineMs);
   const signal = mergeAbortSignals(deadlineCtrl.signal, options?.signal);
 
   try {
@@ -69,7 +69,7 @@ async function request<T>(path: string, options?: RequestInit): Promise<T> {
         e instanceof Error &&
         (e.name === "AbortError" || e.name === "TimeoutError");
       const msg = isAbort
-        ? `API の応答がタイムアウトしました（${REQUEST_DEADLINE_MS / 1000}秒以内に完了しませんでした）。バックエンド (${backendLabel}) が起動しているか、ブラウザから到達できるか確認してください。`
+        ? `API の応答がタイムアウトしました（${deadlineMs / 1000}秒以内に完了しませんでした）。バックエンド (${backendLabel}) が起動しているか、ブラウザから到達できるか確認してください。`
         : `API に接続できませんでした: ${e instanceof Error ? e.message : String(e)}`;
       throw new ApiRequestError(msg, undefined, { cause: e });
     }
@@ -320,6 +320,22 @@ export const api = {
 
   // チャット UI（バックエンドプロキシ経由）
   getChatModels: () => request<import("@/types").ChatModelsResponse>("/api/chat/models"),
+
+  // ストレージ使用状況
+  getStorageOverview: () => request<import("@/types").StorageMount[]>("/api/storage"),
+  // du スキャンは冷キャッシュだと分単位かかるため、通常の 28 秒より長い deadline を使う
+  getStorageUsage: (refresh = false) =>
+    request<import("@/types").StorageUsageReport>(
+      `/api/storage/usage?refresh=${refresh}`,
+      undefined,
+      refresh ? 900_000 : 120_000
+    ),
+  getStorageBreakdown: (path: string, refresh = false) =>
+    request<import("@/types").StorageBreakdown>(
+      `/api/storage/breakdown?path=${encodeURIComponent(path)}&refresh=${refresh}&top=60&timeout_sec=600`,
+      undefined,
+      900_000
+    ),
 };
 
 export interface StreamChatCompletionOptions {

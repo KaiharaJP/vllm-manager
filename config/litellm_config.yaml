@@ -43,12 +43,15 @@ model_list:
       extra_headers:
         X-Vllm-Manager-Source: litellm
   # 任意モデル名を受けるワイルドカード（chat。embedding/rerank は gateway 経由）
+  # model: openai/* でリクエストされたモデル名をそのまま backend へパススルーする。
+  # backend 側はモデル名一致で対象 vLLM インスタンスを選び、同名複数台は
+  # ラウンドロビンで分散する（app/main.py の _pick_target_server）。
   - model_name: "*"
     model_info:
       mode: completion
       disable_background_health_check: true
     litellm_params:
-      model: openai/vllm-local
+      model: openai/*
       api_key: "sk-no-key-required"
       api_base: http://backend:8000/v1
       rpm: 10000

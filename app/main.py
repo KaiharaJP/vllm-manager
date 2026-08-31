@@ -10,7 +10,7 @@ from urllib.parse import quote, urlencode
 from contextlib import asynccontextmanager, suppress
 from typing import Any, Optional
 
-from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect, APIRouter, HTTPException, Request, Response, Query
+from fastapi import Depends, FastAPI, WebSocket, WebSocketDisconnect, APIRouter, HTTPException, Request, Response, Query, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
@@ -80,6 +80,7 @@ from app.litellm_request_track import (
     snapshot as litellm_proxy_snapshot,
 )
 from app.service_health import check_all_services, is_inference_health_probe
+from app import storage_info, training_manager
 from app.request_history import get_record as get_history_record, list_records as list_history_records
 
 BACKEND_INTERNAL_PORT = int(os.environ.get("BACKEND_INTERNAL_PORT", "8000"))
@@ -183,6 +184,8 @@ class ServerStartRequest(BaseModel):
     enable_auto_tool_choice: bool = False
     tool_call_parser: str = ""
     force_stream: bool = True
+    enable_lora: bool = False
+    max_lora_rank: Optional[int] = Field(default=None, ge=8, le=512)
     limit_mm_per_prompt: Optional[dict[str, int]] = None
     mm_encoder_tp_mode: str = ""
     mm_processor_cache_type: str = ""
@@ -967,6 +970,8 @@ async def api_start(req: ServerStartRequest, admin: dict = Depends(require_admin
         mm_processor_cache_type=req.mm_processor_cache_type or None,
         task_type=task_type,
         trust_remote_code=trust_remote_code,
+        enable_lora=req.enable_lora,
+        max_lora_rank=req.max_lora_rank,
         instance_id=req.instance_id,
         instance_name=req.instance_name,
         create_new_instance=resolved["create_new_instance"],
@@ -1064,6 +1069,39 @@ async def api_system_metrics():
     return get_system_metrics()
 
 
+@router.get("/api/storage")
+async def api_storage_overview(_: dict = Depends(require_admin)):
+    """ドライブごとの使用量サマリ（即答）"""
+    return storage_info.get_overview()
+
+
+@router.get("/api/storage/usage")
+async def api_storage_usage(refresh: bool = False, _: dict = Depends(require_admin)):
+    """用途別の内訳（HF キャッシュ: モデル別 / Ollama: モデル別 / 学習ジョブ: ジョブ別）"""
+    import anyio
+
+    return await anyio.to_thread.run_sync(lambda: storage_info.get_usage_report(refresh=refresh))
+
+
+@router.get("/api/storage/breakdown")
+async def api_storage_breakdown(
+    path: str = Query(min_length=1, description="ホスト視点のパス（例: /home）"),
+    refresh: bool = False,
+    timeout_sec: float = Query(default=300.0, ge=10.0, le=1800.0),
+    top: int = Query(default=40, ge=1, le=200),
+    _: dict = Depends(require_admin),
+):
+    """ディレクトリ直下の容量内訳（du。大きなツリーは分単位、結果はキャッシュ）"""
+    import anyio
+
+    result = await anyio.to_thread.run_sync(
+        lambda: storage_info.get_breakdown(path, refresh=refresh, timeout_sec=timeout_sec, top=top)
+    )
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("message"))
+    return result
+
+
 @router.get("/api/log")
 async def api_log(tail: int = 100, instance_id: Optional[str] = None, _: dict = Depends(require_admin)):
     """vLLM サーバーのログを取得"""
@@ -1080,6 +1118,122 @@ async def api_litellm_proxy_request_detail(track_id: str, _: dict = Depends(requ
             raise HTTPException(status_code=404, detail="Request not found")
         return hist
     return detail
+
+
+# --- 学習ジョブ API（LoRA SFT / DPO / GRPO） ---
+
+
+class TrainingJobRequest(BaseModel):
+    method: str = Field(pattern="^(sft|dpo|grpo)$")
+    base_model: str = Field(min_length=1)
+    dataset: str = Field(min_length=1, description="アップロード済み *.jsonl 名 or HF dataset id")
+    gpu_devices: str = Field(min_length=1, description="'1' や '0,1' の形式で明示指定")
+    job_name: Optional[str] = None
+    hyperparams: dict[str, Any] = Field(default_factory=dict)
+    quantization: str = Field(default="4bit", pattern="^(4bit|8bit|none)$")
+    reward: Optional[dict[str, Any]] = None
+    min_free_gb: float = Field(default=16.0, ge=0.0, le=96.0)
+
+
+class DeployAdapterRequest(BaseModel):
+    port: int = Field(ge=1, le=65535, description="LoRA 有効で起動済みの vLLM ポート")
+    lora_name: str = Field(min_length=1, max_length=128)
+
+
+@router.post("/api/training/datasets")
+async def api_training_upload_dataset(file: UploadFile = File(...), _: dict = Depends(require_admin)):
+    """学習データセット（JSONL）をアップロード"""
+    content = await file.read()
+    result = training_manager.save_dataset(file.filename or "", content)
+    if not result.get("success"):
+        raise HTTPException(status_code=400, detail=result.get("message"))
+    return result
+
+
+@router.get("/api/training/datasets")
+async def api_training_list_datasets(_: dict = Depends(require_admin)):
+    return training_manager.list_datasets()
+
+
+@router.post("/api/training/jobs")
+async def api_training_submit(req: TrainingJobRequest, admin: dict = Depends(require_admin)):
+    """学習ジョブを投入（同時実行は 1 ジョブまで）"""
+    result = training_manager.submit_job(
+        method=req.method,
+        base_model=req.base_model,
+        dataset=req.dataset,
+        gpu_devices=req.gpu_devices,
+        job_name=req.job_name,
+        hyperparams=req.hyperparams,
+        quantization=req.quantization,
+        reward=req.reward,
+        min_free_gb=req.min_free_gb,
+    )
+    if not result.get("success"):
+        raise HTTPException(status_code=409, detail=result.get("message"))
+    await event_bus.publish(
+        "training_job",
+        {"status": "submitted", "job_id": result["job_id"], "method": req.method},
+        actor=admin["username"],
+    )
+    return result
+
+
+@router.get("/api/training/jobs")
+async def api_training_jobs(_: dict = Depends(require_admin)):
+    return training_manager.list_jobs()
+
+
+@router.get("/api/training/jobs/{job_id}")
+async def api_training_job_detail(job_id: str, log_tail: int = 0, _: dict = Depends(require_admin)):
+    detail = training_manager.get_job(job_id, log_tail=log_tail)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return detail
+
+
+@router.get("/api/training/jobs/{job_id}/log")
+async def api_training_job_log(job_id: str, tail: int = 200, _: dict = Depends(require_admin)):
+    return {"log": training_manager.get_job_log(job_id, tail=tail)}
+
+
+@router.post("/api/training/jobs/{job_id}/cancel")
+async def api_training_cancel(job_id: str, admin: dict = Depends(require_admin)):
+    result = training_manager.cancel_job(job_id)
+    if not result.get("success"):
+        raise HTTPException(status_code=409, detail=result.get("message"))
+    await event_bus.publish("training_job", {"status": "cancelled", "job_id": job_id}, actor=admin["username"])
+    return result
+
+
+@router.post("/api/training/jobs/{job_id}/deploy")
+async def api_training_deploy(job_id: str, req: DeployAdapterRequest, admin: dict = Depends(require_admin)):
+    """学習済み LoRA アダプタを稼働中 vLLM へホットロード。
+
+    対象 vLLM は enable_lora=true で起動されている必要がある
+    （/api/start の enable_lora パラメータ）。
+    """
+    detail = training_manager.get_job(job_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    if detail["status"].get("status") != "completed":
+        raise HTTPException(status_code=409, detail=f"ジョブが完了していません（status={detail['status'].get('status')}）")
+    async with httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0), trust_env=False) as client:
+        upstream = await client.post(
+            f"http://127.0.0.1:{req.port}/v1/load_lora_adapter",
+            json={"lora_name": req.lora_name, "lora_path": detail["adapter_path"]},
+        )
+    if upstream.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"vLLM がアダプタロードを拒否しました（HTTP {upstream.status_code}）: {upstream.text[:500]}",
+        )
+    await event_bus.publish(
+        "training_job",
+        {"status": "deployed", "job_id": job_id, "lora_name": req.lora_name, "port": req.port},
+        actor=admin["username"],
+    )
+    return {"success": True, "lora_name": req.lora_name, "message": f"アダプタを port {req.port} にロードしました"}
 
 
 @router.get("/api/admin/request-history")
@@ -1375,6 +1529,20 @@ async def _collect_active_vllm_models(
     return all_models
 
 
+# 同一モデルが複数ポートで動いている場合のラウンドロビン用カウンタ。
+# backend プロセス単体（uvicorn workers=1 前提）のメモリ内状態。
+_round_robin_counters: dict[str, int] = {}
+
+
+def _pick_round_robin(key: str, servers: list[dict[str, Any]]) -> dict[str, Any]:
+    if len(servers) == 1:
+        return servers[0]
+    ordered = sorted(servers, key=lambda s: int(s.get("port") or 0))
+    idx = _round_robin_counters.get(key, 0) % len(ordered)
+    _round_robin_counters[key] = idx + 1
+    return ordered[idx]
+
+
 def _pick_target_server(
     requested_model: str,
     servers: list[dict[str, Any]],
@@ -1395,16 +1563,23 @@ def _pick_target_server(
         candidates = typed
 
     if not _is_alias_model(normalized):
+        exact: list[dict[str, Any]] = []
+        suffix: list[dict[str, Any]] = []
         for server in candidates:
             server_model = _normalize_model_id(server.get("model"))
             if not server_model:
                 continue
             if normalized == server_model:
-                return server
-            if "/" in server_model and normalized == server_model.split("/")[-1]:
-                return server
-            if "/" in normalized and normalized.split("/")[-1] == server_model.split("/")[-1]:
-                return server
+                exact.append(server)
+            elif "/" in server_model and normalized == server_model.split("/")[-1]:
+                suffix.append(server)
+            elif "/" in normalized and normalized.split("/")[-1] == server_model.split("/")[-1]:
+                suffix.append(server)
+        # 同じモデルが複数インスタンス立っている場合はラウンドロビンで分散する。
+        # exact 一致を優先し、無ければ suffix 一致（別名/略記マッチ）から選ぶ。
+        matched = exact or suffix
+        if matched:
+            return _pick_round_robin(normalized, matched)
 
     managed = next((s for s in candidates if s.get("managed_by_app")), None)
     if managed:

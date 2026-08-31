@@ -20,6 +20,8 @@ services:
     volumes:
       - vllm-data:/app/data
       - hf-cache:/app/hf-cache
+      # ストレージ使用状況 API（/api/storage*）用。読み取り専用でホスト全体を参照する
+      - /:/hostfs:ro
       # 任意: ホスト CUDA Toolkit で上書きする場合は docker-compose.override.yml で
       # ${CUDA_HOME_HOST}:/usr/local/cuda:ro を追加（12.9 未満だと Blackwell NVFP4 は失敗）
     environment:

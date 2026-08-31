@@ -60,7 +60,7 @@ curl http://hinton.kanazawa-it.ac.jp:14000/v1/embeddings \
   -d '{"model":"jinaai/jina-embeddings-v3","input":"Hello"}'
 ```
 
-vLLM 0.21.0 で特定モデルが起動できない場合は、起動ログを確認し、必要なら vLLM バージョン更新や `pooler_config` 対応を別タスクで検討してください。
+vLLM 0.27.1 で特定モデルが起動できない場合は、起動ログを確認し、必要なら vLLM バージョン更新や `pooler_config` 対応を別タスクで検討してください。
 
 ### HF キャッシュの Permission denied（ダウンロード失敗）
 

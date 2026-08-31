@@ -48,8 +48,35 @@ COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
 
 # バージョン未固定だと build のたびに最新 vLLM が入り、挙動が変わる（例: 0.24 で Blackwell FP8 が DeepGEMM で落ちる）。
-# 本環境では 0.21.0 で Qwen3.6-27B-FP8 等の稼働実績あり（docs/mtp-investigation-report.md）。
-RUN pip3 install --no-cache-dir "vllm==0.21.0"
+# 0.27.1 は Qwen3.8（内部的に Qwen3.5 系アーキテクチャ）を使うために採用。
+# ただし sm120 (Blackwell) + FP8 ブロックスケールで DeepGEMM が "Unknown SF transformation" で
+# 落ちる既知の不具合が 0.27.1 時点でも未解決のため、下記 ENV で DeepGEMM 経路を無効化する
+# （https://github.com/vllm-project/vllm/issues/51884 ／ NVFP4 モデルは影響を受けない）。
+RUN pip3 install --no-cache-dir "vllm==0.27.1"
+
+# vllm 0.27.1 が引き込む flashinfer-python==0.6.16.post3 は fd_exchange.py に
+# `from __future__ import annotations` が無く、Python 3.10 では
+# `array.array[int]` のアノテーション評価で起動時に TypeError になる
+# （0.6.16.post4 で修正済み）。
+RUN pip3 install --no-cache-dir "flashinfer-python==0.6.16.post4"
+
+# 学習ジョブ API（LoRA SFT / DPO / GRPO）用。transformers は vllm が入れた
+# バージョンに固定し、resolver による意図しない差し替えを防ぐ。
+RUN pip3 install --no-cache-dir "transformers==5.15.0" peft trl datasets accelerate bitsandbytes "kernels>=0.11.1"
+
+# ストレージ内訳 API 用: 非root(vllmapp)でも /hostfs（ro マウント）配下の
+# 他ユーザーディレクトリを du で集計できるよう、読み取り権限チェックを
+# バイパスする file capability 付きの du コピーを用意する。
+# サイズ情報のみ取得可能（ファイル内容は読めない）。/hostfs は read-only
+# マウントのため書き込みも不可能なまま。
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libcap2-bin \
+    && rm -rf /var/lib/apt/lists/* \
+    && cp /usr/bin/du /usr/local/bin/du-priv \
+    && setcap cap_dac_override+ep /usr/local/bin/du-priv
+
+ENV VLLM_USE_DEEP_GEMM=0
+ENV VLLM_MOE_USE_DEEP_GEMM=0
 
 COPY app/ ./app/
 COPY config/ ./config/

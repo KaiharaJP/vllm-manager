@@ -175,7 +175,7 @@ class ServerStartRequest(BaseModel):
     default_top_p: float = Field(default=0.95, ge=0.0, le=1.0)
     default_frequency_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
     default_presence_penalty: float = Field(default=0.0, ge=-2.0, le=2.0)
-    gpu_memory_mode: str = Field(default="auto", pattern="^(auto|manual)$")
+    gpu_memory_mode: str = Field(default="auto", pattern="^(auto|manual|minimal)$")
     gpu_memory_utilization: float = Field(default=0.85, ge=0.1, le=1.0)
     tensor_parallel_size: int = Field(default=1, ge=1, le=8)
     gpu_devices: str = "all"

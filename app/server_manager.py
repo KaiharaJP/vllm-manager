@@ -14,7 +14,7 @@ import json
 import uuid
 from pathlib import Path
 from typing import Any, Optional
-from huggingface_hub import snapshot_download
+from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 
 # --- パス設定 (Docker 内で共有) ---
 DATA_DIR = Path(os.environ.get("VLLM_MANAGER_DATA_DIR", "/tmp/vllm-manager-data"))
@@ -51,6 +51,12 @@ CONTEXT_PRESETS = [
 ]
 MAX_NUM_SEQS_LIMIT = 20
 GPU_MEMORY_UTILIZATION_SAFE_MAX = 0.85
+GPU_MEMORY_MODES = frozenset({"auto", "manual", "minimal"})
+
+
+def _normalize_gpu_memory_mode(value: Any) -> str:
+    normalized = str(value or "auto").lower()
+    return normalized if normalized in GPU_MEMORY_MODES else "auto"
 
 
 def _clamp_default_sampling_params(config: dict[str, Any]) -> None:
@@ -229,9 +235,7 @@ def _normalize_config_payload(config: dict[str, Any]) -> dict[str, Any]:
     payload["max_num_seqs"] = max(1, min(MAX_NUM_SEQS_LIMIT, int(payload.get("max_num_seqs", 1))))
     _clamp_default_sampling_params(payload)
     payload["context_length"] = max(1024, min(262144, int(payload.get("context_length", 8192))))
-    payload["gpu_memory_mode"] = (
-        "manual" if str(payload.get("gpu_memory_mode", "auto")).lower() == "manual" else "auto"
-    )
+    payload["gpu_memory_mode"] = _normalize_gpu_memory_mode(payload.get("gpu_memory_mode"))
     payload["gpu_memory_utilization"] = max(
         0.1, min(GPU_MEMORY_UTILIZATION_SAFE_MAX, float(payload.get("gpu_memory_utilization", 0.85)))
     )
@@ -634,6 +638,11 @@ def _build_command(config: dict) -> list:
         "--gpu-memory-utilization", str(config["gpu_memory_utilization"]),
         "--tensor-parallel-size", str(config["tensor_parallel_size"]),
     ]
+    kv_cache_memory_bytes = config.get("_kv_cache_memory_bytes")
+    if kv_cache_memory_bytes:
+        # 最低限モード: gpu-memory-utilization は上限の安全弁のみで、
+        # 実際のKVキャッシュ量はこのバイト数で直接指定する。
+        cmd += ["--kv-cache-memory", str(int(kv_cache_memory_bytes))]
     if task_type in POOLING_TASK_TYPES:
         cmd.extend(["--runner", "pooling"])
     else:
@@ -871,6 +880,106 @@ def _vllm_subprocess_env(config: dict) -> dict[str, str]:
     return env
 
 
+_MODEL_WEIGHT_BYTES_CACHE: dict[str, Optional[int]] = {}
+_MODEL_KV_BYTES_PER_TOKEN_CACHE: dict[str, Optional[int]] = {}
+_WEIGHT_FILE_SUFFIXES = (".safetensors", ".bin", ".gguf", ".pt")
+
+
+def _model_weight_bytes(model_id: str) -> Optional[int]:
+    """モデル重みの合計バイト数を、ダウンロードせず HF API のファイル一覧から見積もる。"""
+    if model_id in _MODEL_WEIGHT_BYTES_CACHE:
+        return _MODEL_WEIGHT_BYTES_CACHE[model_id]
+    result: Optional[int] = None
+    try:
+        info = HfApi().model_info(model_id, files_metadata=True)
+        total = sum(
+            (getattr(s, "size", None) or 0)
+            for s in (info.siblings or [])
+            if s.rfilename.endswith(_WEIGHT_FILE_SUFFIXES)
+        )
+        if total > 0:
+            result = int(total)
+    except Exception:
+        result = None
+    _MODEL_WEIGHT_BYTES_CACHE[model_id] = result
+    return result
+
+
+def _model_kv_cache_bytes_per_token(model_id: str) -> Optional[int]:
+    """1トークンあたりの KV キャッシュサイズ（バイト）を config.json から見積もる。
+
+    2 (K/V) * レイヤ数 * KVヘッド数 * head_dim * dtype バイト数。
+    マルチモーダルモデルは text_config 配下に言語モデル設定が入ることがあるため、
+    そちらを優先的に見る。
+    """
+    if model_id in _MODEL_KV_BYTES_PER_TOKEN_CACHE:
+        return _MODEL_KV_BYTES_PER_TOKEN_CACHE[model_id]
+    result: Optional[int] = None
+    try:
+        config_path = hf_hub_download(repo_id=model_id, filename="config.json")
+        cfg = json.loads(Path(config_path).read_text())
+        cfg = cfg.get("text_config") or cfg
+
+        num_layers = cfg.get("num_hidden_layers") or cfg.get("n_layer")
+        num_attn_heads = cfg.get("num_attention_heads") or cfg.get("n_head")
+        num_kv_heads = cfg.get("num_key_value_heads") or num_attn_heads
+        hidden_size = cfg.get("hidden_size") or cfg.get("n_embd")
+        head_dim = cfg.get("head_dim")
+        if not head_dim and hidden_size and num_attn_heads:
+            head_dim = hidden_size / num_attn_heads
+
+        if num_layers and num_kv_heads and head_dim:
+            dtype_bytes = 2  # bf16/fp16 前提（fp8 kv-cache 等は考慮しない安全側の見積もり）
+            result = int(2 * num_layers * num_kv_heads * head_dim * dtype_bytes)
+    except Exception:
+        result = None
+    _MODEL_KV_BYTES_PER_TOKEN_CACHE[model_id] = result
+    return result
+
+
+def _minimal_gpu_memory_plan(config: dict) -> tuple[Optional[float], Optional[int], Optional[str]]:
+    """「最低限モード」向けに (gpu_memory_utilization 上限, --kv-cache-memory バイト数, エラー) を返す。
+
+    KV キャッシュは指定された context_length * max_num_seqs 分だけ確保する
+    （ユーザーが同時実行数・コンテキスト長を明示している前提）。
+    見積もりに必要な情報が取れない場合は auto モードにフォールバックさせる。
+    """
+    model_id = str(config.get("model_id", ""))
+    weight_bytes = _model_weight_bytes(model_id)
+    kv_per_token = _model_kv_cache_bytes_per_token(model_id)
+    if weight_bytes is None or kv_per_token is None:
+        return None, None, (
+            f"モデル {model_id} の重み/設定サイズを取得できなかったため、"
+            "最低限モードの計算をスキップしました（auto にフォールバック）。"
+        )
+
+    context_length = int(config.get("context_length", 8192))
+    max_num_seqs = max(1, int(config.get("max_num_seqs", 1)))
+    kv_cache_bytes = kv_per_token * context_length * max_num_seqs
+
+    inventory = _read_gpu_inventory()
+    selected = _selected_gpu_order(str(config.get("gpu_devices", "all")), inventory) if inventory else []
+    tp = max(1, int(config.get("tensor_parallel_size", 1)))
+    total_mb = None
+    if selected:
+        target_gpus = selected[:tp]
+        # tensor_parallel_size > 1 では重み・KVキャッシュは GPU 間で分割される想定
+        total_mb = min(inventory[i]["total_mb"] for i in target_gpus)
+
+    # 重み + KV キャッシュ + アクティベーション等の安全マージン（+15%、最低1.5GiB）
+    required_bytes = weight_bytes / max(1, tp) + kv_cache_bytes
+    margin_bytes = max(int(required_bytes * 0.15), 1_500_000_000)
+    required_bytes += margin_bytes
+
+    if total_mb:
+        util = required_bytes / (total_mb * 1024 * 1024)
+        util = max(0.1, min(GPU_MEMORY_UTILIZATION_SAFE_MAX, round(util, 2)))
+    else:
+        util = GPU_MEMORY_UTILIZATION_SAFE_MAX
+
+    return util, kv_cache_bytes, None
+
+
 def _auto_gpu_memory_utilization(config: dict) -> tuple[Optional[float], Optional[str]]:
     inventory = _read_gpu_inventory()
     if not inventory:
@@ -979,7 +1088,7 @@ def start_server(
         config["default_presence_penalty"] = default_presence_penalty
     _clamp_default_sampling_params(config)
     if gpu_memory_mode is not None:
-        config["gpu_memory_mode"] = "manual" if str(gpu_memory_mode).lower() == "manual" else "auto"
+        config["gpu_memory_mode"] = _normalize_gpu_memory_mode(gpu_memory_mode)
     if gpu_memory_utilization is not None:
         config["gpu_memory_utilization"] = max(
             0.1, min(GPU_MEMORY_UTILIZATION_SAFE_MAX, float(gpu_memory_utilization))
@@ -1053,7 +1162,22 @@ def start_server(
         result["steps"].append("起動前チェック: tool_call_parser が空のため中止しました。")
         return result
 
-    if str(config.get("gpu_memory_mode", "auto")).lower() == "auto":
+    gpu_memory_mode = _normalize_gpu_memory_mode(config.get("gpu_memory_mode"))
+    config.pop("_kv_cache_memory_bytes", None)
+    if gpu_memory_mode == "minimal":
+        minimal_util, minimal_kv_bytes, minimal_error = _minimal_gpu_memory_plan(config)
+        if minimal_error:
+            result["steps"].append(f"最低限モード: {minimal_error}")
+            gpu_memory_mode = "auto"
+        else:
+            config["gpu_memory_utilization"] = minimal_util
+            config["_kv_cache_memory_bytes"] = minimal_kv_bytes
+            result["steps"].append(
+                f"最低限モード: KVキャッシュ {minimal_kv_bytes / 1024**3:.2f} GiB を確保"
+                f"（context_length={config.get('context_length')} × max_num_seqs={config.get('max_num_seqs')}）、"
+                f"上限 gpu_memory_utilization={minimal_util}"
+            )
+    if gpu_memory_mode == "auto":
         auto_util, auto_error = _auto_gpu_memory_utilization(config)
         if auto_error:
             result["message"] = f"起動前チェック失敗: {auto_error}"

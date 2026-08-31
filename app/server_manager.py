@@ -940,22 +940,36 @@ def _model_kv_cache_bytes_per_token(model_id: str) -> Optional[int]:
 def _minimal_gpu_memory_plan(config: dict) -> tuple[Optional[float], Optional[int], Optional[str]]:
     """「最低限モード」向けに (gpu_memory_utilization 上限, --kv-cache-memory バイト数, エラー) を返す。
 
-    KV キャッシュは指定された context_length * max_num_seqs 分だけ確保する
-    （ユーザーが同時実行数・コンテキスト長を明示している前提）。
+    chat: 指定された context_length * max_num_seqs 分の KV キャッシュを
+    --kv-cache-memory で明示確保する（ユーザーが同時実行数・コンテキスト長を
+    明示している前提）。
+    embedding/rerank（pooling runner）: vLLM は生成のための KV キャッシュを
+    実質使わない（実測でも --kv-cache-memory の要求量をほぼ無視し、重みサイズ
+    相当しか使わない）。そのため KV 計算はスキップし、重みサイズのみから
+    gpu_memory_utilization を決める（--kv-cache-memory は付与しない）。
     見積もりに必要な情報が取れない場合は auto モードにフォールバックさせる。
     """
     model_id = str(config.get("model_id", ""))
     weight_bytes = _model_weight_bytes(model_id)
-    kv_per_token = _model_kv_cache_bytes_per_token(model_id)
-    if weight_bytes is None or kv_per_token is None:
+    if weight_bytes is None:
         return None, None, (
-            f"モデル {model_id} の重み/設定サイズを取得できなかったため、"
+            f"モデル {model_id} の重みサイズを取得できなかったため、"
             "最低限モードの計算をスキップしました（auto にフォールバック）。"
         )
 
-    context_length = int(config.get("context_length", 8192))
-    max_num_seqs = max(1, int(config.get("max_num_seqs", 1)))
-    kv_cache_bytes = kv_per_token * context_length * max_num_seqs
+    task_type = _normalize_task_type(config.get("task_type"))
+    if task_type in POOLING_TASK_TYPES:
+        kv_cache_bytes = 0
+    else:
+        kv_per_token = _model_kv_cache_bytes_per_token(model_id)
+        if kv_per_token is None:
+            return None, None, (
+                f"モデル {model_id} の設定サイズを取得できなかったため、"
+                "最低限モードの計算をスキップしました（auto にフォールバック）。"
+            )
+        context_length = int(config.get("context_length", 8192))
+        max_num_seqs = max(1, int(config.get("max_num_seqs", 1)))
+        kv_cache_bytes = kv_per_token * context_length * max_num_seqs
 
     inventory = _read_gpu_inventory()
     selected = _selected_gpu_order(str(config.get("gpu_devices", "all")), inventory) if inventory else []
@@ -977,7 +991,7 @@ def _minimal_gpu_memory_plan(config: dict) -> tuple[Optional[float], Optional[in
     else:
         util = GPU_MEMORY_UTILIZATION_SAFE_MAX
 
-    return util, kv_cache_bytes, None
+    return util, (kv_cache_bytes or None), None
 
 
 def _auto_gpu_memory_utilization(config: dict) -> tuple[Optional[float], Optional[str]]:
@@ -1171,12 +1185,18 @@ def start_server(
             gpu_memory_mode = "auto"
         else:
             config["gpu_memory_utilization"] = minimal_util
-            config["_kv_cache_memory_bytes"] = minimal_kv_bytes
-            result["steps"].append(
-                f"最低限モード: KVキャッシュ {minimal_kv_bytes / 1024**3:.2f} GiB を確保"
-                f"（context_length={config.get('context_length')} × max_num_seqs={config.get('max_num_seqs')}）、"
-                f"上限 gpu_memory_utilization={minimal_util}"
-            )
+            if minimal_kv_bytes:
+                config["_kv_cache_memory_bytes"] = minimal_kv_bytes
+                result["steps"].append(
+                    f"最低限モード: KVキャッシュ {minimal_kv_bytes / 1024**3:.2f} GiB を確保"
+                    f"（context_length={config.get('context_length')} × max_num_seqs={config.get('max_num_seqs')}）、"
+                    f"上限 gpu_memory_utilization={minimal_util}"
+                )
+            else:
+                result["steps"].append(
+                    f"最低限モード: embedding/rerank は KV キャッシュ不要のため重みサイズのみで算出"
+                    f"（上限 gpu_memory_utilization={minimal_util}）"
+                )
     if gpu_memory_mode == "auto":
         auto_util, auto_error = _auto_gpu_memory_utilization(config)
         if auto_error:

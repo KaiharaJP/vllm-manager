@@ -1586,145 +1586,162 @@ export default function ServerControl({
                   <td className="px-3 py-2 text-xs text-gray-300">
                     {server.managed_by_app ? "このアプリ管理" : "外部起動"}
                   </td>
-                  <td className="px-3 py-2">
-                    <div className="flex flex-col gap-1">
-                      {server.instance_id && server.managed_by_app && (
-                        <div className="mb-1 rounded-lg border border-white/10 bg-bg-primary/50 p-2">
-                          <label className="mb-1 block text-[10px] text-gray-400">
-                            移設先 GPU（{server.tensor_parallel_size ?? 1}台）
-                          </label>
-                          <input
-                            type="text"
-                            inputMode="numeric"
-                            value={moveTargets[server.instance_id] || ""}
-                            onChange={(e) =>
-                              setMoveTargets((prev) => ({
-                                ...prev,
-                                [server.instance_id!]: e.target.value,
-                              }))
-                            }
-                            disabled={movingInstanceId === server.instance_id}
-                            placeholder={
-                              (server.tensor_parallel_size ?? 1) > 1 ? "例: 2,3" : "例: 2"
-                            }
-                            aria-label={`${server.instance_name || server.instance_id} の移設先 GPU`}
-                            className="mb-1 w-28 rounded border border-white/10 bg-bg-tertiary px-2 py-1 text-xs text-white placeholder:text-gray-600 disabled:opacity-50"
-                          />
-                          <button
-                            onClick={() => handleMoveInstance(server)}
-                            disabled={
-                              movingInstanceId === server.instance_id ||
-                              !(moveTargets[server.instance_id] || "").trim()
-                            }
-                            className="flex w-full items-center justify-center gap-1 rounded-lg bg-amber-500/20 px-2 py-1.5 text-xs text-amber-300 hover:bg-amber-500/30 disabled:opacity-50"
-                          >
-                            <ArrowRightLeft className="h-3.5 w-3.5" />
-                            {movingInstanceId === server.instance_id ? "移設中..." : "GPU 移設"}
-                          </button>
-                          {gpuOptions.length > 0 && (
-                            <div className="mt-1 text-[10px] text-gray-500">
-                              利用可能: {gpuOptions.map((gpu) => gpu.index).join(", ")}
+                  <td className="w-[260px] align-top px-3 py-2">
+                    <div className="min-w-[230px] space-y-2">
+                      {server.instance_id && server.managed_by_app ? (
+                        <>
+                          <div className="grid grid-cols-2 gap-1">
+                            <button
+                              onClick={() => handleSmokeTest(server.instance_id!)}
+                              disabled={
+                                smokeTestingId === server.instance_id ||
+                                movingInstanceId === server.instance_id ||
+                                swappingInstances.includes(server.instance_id)
+                              }
+                              className="rounded-lg bg-accent-primary/20 px-2 py-1.5 text-xs text-accent-primary transition-colors hover:bg-accent-primary/30 disabled:opacity-50"
+                            >
+                              {smokeTestingId === server.instance_id ? "確認中..." : "疎通テスト"}
+                            </button>
+                            <button
+                              onClick={() => handleStopByInstance(server.instance_id!)}
+                              disabled={
+                                stoppingInstanceId === server.instance_id ||
+                                movingInstanceId === server.instance_id ||
+                                swappingInstances.includes(server.instance_id)
+                              }
+                              className="rounded-lg bg-accent-danger/20 px-2 py-1.5 text-xs text-accent-danger transition-colors hover:bg-accent-danger/30 disabled:opacity-50"
+                            >
+                              {stoppingInstanceId === server.instance_id ? "停止中..." : "停止"}
+                            </button>
+                          </div>
+
+                          {smokeTestResults[server.instance_id] && (
+                            <div
+                              className={`rounded px-2 py-1 text-[10px] ${
+                                smokeTestResults[server.instance_id].success
+                                  ? "bg-accent-success/10 text-accent-success"
+                                  : "bg-accent-danger/10 text-accent-danger"
+                              }`}
+                            >
+                              {smokeTestResults[server.instance_id].success ? (
+                                <>
+                                  OK {smokeTestResults[server.instance_id].latency_ms}ms
+                                  {smokeTestResults[server.instance_id].tokens_per_sec != null &&
+                                    ` / ${smokeTestResults[server.instance_id].tokens_per_sec} tok/s`}
+                                </>
+                              ) : (
+                                smokeTestResults[server.instance_id].error || "失敗"
+                              )}
                             </div>
                           )}
-                        </div>
+
+                          <details className="rounded-lg border border-white/10 bg-bg-primary/50">
+                            <summary className="flex cursor-pointer list-none items-center justify-between gap-2 px-2 py-1.5 text-xs text-gray-300 [&::-webkit-details-marker]:hidden">
+                              <span className="inline-flex items-center gap-1.5">
+                                <ArrowRightLeft className="h-3.5 w-3.5 text-amber-300" />
+                                GPU操作
+                              </span>
+                              <span className="text-[10px] text-gray-500">移設 / 交換</span>
+                            </summary>
+                            <div className="space-y-2 border-t border-white/10 p-2">
+                              <div>
+                                <label className="mb-1 block text-[10px] text-gray-400">
+                                  移設先 GPU（{server.tensor_parallel_size ?? 1}台）
+                                </label>
+                                <div className="flex gap-1">
+                                  <input
+                                    type="text"
+                                    inputMode="numeric"
+                                    value={moveTargets[server.instance_id] || ""}
+                                    onChange={(e) =>
+                                      setMoveTargets((prev) => ({
+                                        ...prev,
+                                        [server.instance_id!]: e.target.value,
+                                      }))
+                                    }
+                                    disabled={movingInstanceId === server.instance_id}
+                                    placeholder={
+                                      (server.tensor_parallel_size ?? 1) > 1 ? "例: 2,3" : "例: 2"
+                                    }
+                                    aria-label={`${server.instance_name || server.instance_id} の移設先 GPU`}
+                                    className="min-w-0 flex-1 rounded border border-white/10 bg-bg-tertiary px-2 py-1 text-xs text-white placeholder:text-gray-600 disabled:opacity-50"
+                                  />
+                                  <button
+                                    onClick={() => handleMoveInstance(server)}
+                                    disabled={
+                                      movingInstanceId === server.instance_id ||
+                                      !(moveTargets[server.instance_id] || "").trim()
+                                    }
+                                    className="shrink-0 rounded-lg bg-amber-500/20 px-2 py-1 text-xs text-amber-300 transition-colors hover:bg-amber-500/30 disabled:opacity-50"
+                                  >
+                                    {movingInstanceId === server.instance_id ? "移設中..." : "移設"}
+                                  </button>
+                                </div>
+                                {gpuOptions.length > 0 && (
+                                  <div className="mt-1 text-[10px] text-gray-500">
+                                    利用可能: {gpuOptions.map((gpu) => gpu.index).join(", ")}
+                                  </div>
+                                )}
+                              </div>
+
+                              <div>
+                                <label className="mb-1 block text-[10px] text-gray-400">
+                                  GPU交換先インスタンス
+                                </label>
+                                <div className="flex gap-1">
+                                  <select
+                                    value={swapTargets[server.instance_id] || ""}
+                                    onChange={(e) =>
+                                      setSwapTargets((prev) => ({
+                                        ...prev,
+                                        [server.instance_id!]: e.target.value,
+                                      }))
+                                    }
+                                    disabled={swappingInstances.includes(server.instance_id)}
+                                    aria-label={`${server.instance_name || server.instance_id} のGPU交換先`}
+                                    className="min-w-0 flex-1 rounded border border-white/10 bg-bg-tertiary px-2 py-1 text-xs text-white disabled:opacity-50"
+                                  >
+                                    <option value="">交換先を選択</option>
+                                    {runningServers
+                                      .filter(
+                                        (candidate) =>
+                                          candidate.instance_id &&
+                                          candidate.instance_id !== server.instance_id &&
+                                          candidate.managed_by_app
+                                      )
+                                      .map((candidate) => (
+                                        <option key={candidate.instance_id!} value={candidate.instance_id ?? ""}>
+                                          {candidate.instance_name || candidate.instance_id}（GPU {candidate.using_gpu_indices.join(",") || candidate.gpu_devices}）
+                                        </option>
+                                      ))}
+                                  </select>
+                                  <button
+                                    onClick={() => handleSwapInstances(server)}
+                                    disabled={
+                                      swappingInstances.includes(server.instance_id) ||
+                                      !(swapTargets[server.instance_id] || "").trim()
+                                    }
+                                    className="shrink-0 rounded-lg bg-sky-500/20 px-2 py-1 text-xs text-sky-300 transition-colors hover:bg-sky-500/30 disabled:opacity-50"
+                                  >
+                                    {swappingInstances.includes(server.instance_id) ? "交換中..." : "交換"}
+                                  </button>
+                                </div>
+                              </div>
+                            </div>
+                          </details>
+                        </>
+                      ) : (
+                        <div className="text-[10px] text-gray-500">外部起動プロセス</div>
                       )}
-                      {server.instance_id && server.managed_by_app && (
-                        <div className="mb-1 rounded-lg border border-white/10 bg-bg-primary/50 p-2">
-                          <label className="mb-1 block text-[10px] text-gray-400">
-                            GPU交換先インスタンス
-                          </label>
-                          <select
-                            value={swapTargets[server.instance_id] || ""}
-                            onChange={(e) =>
-                              setSwapTargets((prev) => ({
-                                ...prev,
-                                [server.instance_id!]: e.target.value,
-                              }))
-                            }
-                            disabled={swappingInstances.includes(server.instance_id)}
-                            aria-label={`${server.instance_name || server.instance_id} のGPU交換先`}
-                            className="mb-1 w-full rounded border border-white/10 bg-bg-tertiary px-2 py-1 text-xs text-white disabled:opacity-50"
-                          >
-                            <option value="">交換先を選択</option>
-                            {runningServers
-                              .filter(
-                                (candidate) =>
-                                  candidate.instance_id &&
-                                  candidate.instance_id !== server.instance_id &&
-                                  candidate.managed_by_app
-                              )
-                              .map((candidate) => (
-                                <option key={candidate.instance_id!} value={candidate.instance_id ?? ""}>
-                                  {candidate.instance_name || candidate.instance_id}（GPU {candidate.using_gpu_indices.join(",") || candidate.gpu_devices}）
-                                </option>
-                              ))}
-                          </select>
-                          <button
-                            onClick={() => handleSwapInstances(server)}
-                            disabled={
-                              swappingInstances.includes(server.instance_id) ||
-                              !(swapTargets[server.instance_id] || "").trim()
-                            }
-                            className="flex w-full items-center justify-center gap-1 rounded-lg bg-sky-500/20 px-2 py-1.5 text-xs text-sky-300 hover:bg-sky-500/30 disabled:opacity-50"
-                          >
-                            <ArrowRightLeft className="h-3.5 w-3.5" />
-                            {swappingInstances.includes(server.instance_id) ? "GPU交換中..." : "GPU交換"}
-                          </button>
-                        </div>
-                      )}
-                      {server.instance_id && server.managed_by_app && (
-                        <button
-                          onClick={() => handleSmokeTest(server.instance_id!)}
-                          disabled={
-                            smokeTestingId === server.instance_id ||
-                            movingInstanceId === server.instance_id ||
-                            swappingInstances.includes(server.instance_id)
-                          }
-                          className="px-3 py-1.5 rounded-lg bg-accent-primary/20 hover:bg-accent-primary/30 text-accent-primary disabled:opacity-50 text-xs"
-                        >
-                          {smokeTestingId === server.instance_id ? "疎通確認中..." : "疎通テスト"}
-                        </button>
-                      )}
-                      {server.instance_id && smokeTestResults[server.instance_id] && (
-                        <div
-                          className={`text-[10px] rounded px-2 py-1 ${
-                            smokeTestResults[server.instance_id].success
-                              ? "bg-accent-success/10 text-accent-success"
-                              : "bg-accent-danger/10 text-accent-danger"
-                          }`}
-                        >
-                          {smokeTestResults[server.instance_id].success ? (
-                            <>
-                              OK {smokeTestResults[server.instance_id].latency_ms}ms
-                              {smokeTestResults[server.instance_id].tokens_per_sec != null &&
-                                ` / ${smokeTestResults[server.instance_id].tokens_per_sec} tok/s`}
-                            </>
-                          ) : (
-                            smokeTestResults[server.instance_id].error || "失敗"
-                          )}
-                        </div>
-                      )}
-                      {server.instance_id && server.managed_by_app && (
-                        <button
-                          onClick={() => handleStopByInstance(server.instance_id!)}
-                          disabled={
-                            stoppingInstanceId === server.instance_id ||
-                            movingInstanceId === server.instance_id ||
-                            swappingInstances.includes(server.instance_id)
-                          }
-                          className="px-3 py-1.5 rounded-lg bg-accent-danger/20 hover:bg-accent-danger/30 text-accent-danger disabled:opacity-50 text-xs"
-                        >
-                          {stoppingInstanceId === server.instance_id ? "停止中..." : "インスタンス停止"}
-                        </button>
-                      )}
+
                       <button
                         onClick={() => handleStopByPid(server.pid)}
                         disabled={
                           stoppingPid === server.pid || movingInstanceId === server.instance_id
                         }
-                        className="px-3 py-1.5 rounded-lg bg-accent-danger/20 hover:bg-accent-danger/30 text-accent-danger disabled:opacity-50 text-xs"
+                        className="w-full rounded-lg border border-accent-danger/20 bg-accent-danger/10 px-2 py-1.5 text-xs text-accent-danger transition-colors hover:bg-accent-danger/20 disabled:opacity-50"
                       >
-                        {stoppingPid === server.pid ? "停止中..." : "PID 停止"}
+                        {stoppingPid === server.pid ? "PID停止中..." : "PIDで停止"}
                       </button>
                     </div>
                   </td>

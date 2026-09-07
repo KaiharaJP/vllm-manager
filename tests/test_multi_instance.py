@@ -182,6 +182,70 @@ class ServerManagerInstanceTests(unittest.TestCase):
         self.assertNotIn("--enable-auto-tool-choice", cmd)
         self.assertNotIn("--speculative-config", cmd)
 
+    def test_minimal_pooling_memory_scales_with_weight_size(self):
+        inventory = {
+            0: {
+                "total_mb": 98 * 1024,
+                "used_mb": 0,
+                "free_mb": 98 * 1024,
+            }
+        }
+        config = {
+            "model_id": "org/embedding",
+            "task_type": "embedding",
+            "gpu_devices": "0",
+            "tensor_parallel_size": 1,
+        }
+
+        with patch.object(self.sm, "_read_gpu_inventory", return_value=inventory):
+            with patch.object(
+                self.sm,
+                "_model_weight_bytes",
+                return_value=1 * 1024**3,
+            ):
+                small_util, small_kv, small_error = self.sm._minimal_gpu_memory_plan(config)
+            with patch.object(
+                self.sm,
+                "_model_weight_bytes",
+                return_value=8_000_000_000,
+            ):
+                large_util, large_kv, large_error = self.sm._minimal_gpu_memory_plan(config)
+
+        # 小さいモデルは下限 0.1 に収まるが、約8GBモデルは同じ 0.1 に
+        # 丸め込まず、重みサイズに応じた値になることを確認する。
+        self.assertEqual(small_util, 0.1)
+        self.assertGreater(large_util, small_util)
+        self.assertIsNone(small_kv)
+        self.assertIsNone(large_kv)
+        self.assertIsNone(small_error)
+        self.assertIsNone(large_error)
+
+    def test_minimal_pooling_memory_scales_for_rerank_too(self):
+        config = {
+            "model_id": "org/reranker",
+            "task_type": "rerank",
+            "gpu_devices": "0",
+            "tensor_parallel_size": 1,
+        }
+        inventory = {
+            0: {
+                "total_mb": 98 * 1024,
+                "used_mb": 0,
+                "free_mb": 98 * 1024,
+            }
+        }
+        with patch.object(self.sm, "_read_gpu_inventory", return_value=inventory):
+            with patch.object(
+                self.sm,
+                "_model_weight_bytes",
+                return_value=8_000_000_000,
+            ):
+                util, kv_bytes, error = self.sm._minimal_gpu_memory_plan(config)
+
+        self.assertGreater(util, 0.1)
+        self.assertIsNone(kv_bytes)
+        self.assertIsNone(error)
+
 
 class ProxyRoutingTests(unittest.TestCase):
     def setUp(self):

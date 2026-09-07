@@ -137,6 +137,23 @@ export interface ApiResponse {
   instance_id?: string;
 }
 
+export interface InstanceMoveResponse extends ApiResponse {
+  instance_id: string;
+  source_gpu_devices: string | null;
+  target_gpu_devices: string | null;
+  rollback_attempted: boolean;
+  rollback_success: boolean | null;
+}
+
+export interface InstanceSwapResponse extends ApiResponse {
+  first_instance_id: string;
+  second_instance_id: string;
+  first_source_gpu_devices: string | null;
+  second_source_gpu_devices: string | null;
+  rollback_attempted: boolean;
+  rollback_success: boolean | null;
+}
+
 export interface ApiToken {
   id: string;
   name: string;

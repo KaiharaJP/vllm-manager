@@ -206,6 +206,19 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ instance_id }),
     }),
+  moveInstance: (instance_id: string, gpu_devices: string) =>
+    request<import("@/types").InstanceMoveResponse>(
+      `/api/instances/${encodeURIComponent(instance_id)}/move`,
+      {
+        method: "POST",
+        body: JSON.stringify({ gpu_devices }),
+      }
+    ),
+  swapInstances: (first_instance_id: string, second_instance_id: string) =>
+    request<import("@/types").InstanceSwapResponse>("/api/instances/swap", {
+      method: "POST",
+      body: JSON.stringify({ first_instance_id, second_instance_id }),
+    }),
   stopServerByPid: (pid: number) =>
     request<{ success: boolean; message: string; pid?: number }>("/api/servers/stop", {
       method: "POST",

@@ -210,6 +210,9 @@ Commands:
   servers                             List running vLLM processes
   instances                           List managed instances
   instances stop --id <instance_id>   Stop a managed instance
+  instances move --id <id> --gpus 2,3 Move a running instance to other GPUs
+  instances swap --first <id> --second <id>
+                                      Swap the GPUs of two running instances
   start <model_id> [options]          Start vLLM (chat / embedding / rerank)
   stop                                Stop default vLLM server
   restart                             Restart default vLLM server
@@ -292,6 +295,7 @@ Examples:
   $0 start jinaai/jina-embeddings-v3 --task-type embedding --context-length 8192
   $0 start Qwen/Qwen2.5-7B-Instruct --context-length 32768
   $0 instances
+  $0 instances move --id chat-main --gpus 2,3
   $0 smoke-test <instance_id>
   $0 stop
 EOF
@@ -335,8 +339,55 @@ cmd_instances() {
       body="$(jq -n --arg instance_id "$instance_id" '{instance_id: $instance_id}')"
       api_request POST "/api/instances/stop" "$body" | jq .
       ;;
+    move)
+      local instance_id=""
+      local gpu_devices=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --id)
+            instance_id="$2"
+            shift 2
+            ;;
+          --gpus|--gpu-devices)
+            gpu_devices="$2"
+            shift 2
+            ;;
+          *)
+            die "Unknown option: $1"
+            ;;
+        esac
+      done
+      [[ -n "$instance_id" ]] || die "instance_id required (instances move --id <id> --gpus <gpu_ids>)"
+      [[ "$gpu_devices" =~ ^[0-9]+(,[0-9]+)*$ ]] || die "--gpus must be comma-separated GPU numbers (example: 2,3)"
+      local body
+      body="$(jq -n --arg gpu_devices "$gpu_devices" '{gpu_devices: $gpu_devices}')"
+      api_request POST "/api/instances/${instance_id}/move" "$body" | jq .
+      ;;
+    swap)
+      local first_instance_id=""
+      local second_instance_id=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --first|--first-id)
+            first_instance_id="$2"
+            shift 2
+            ;;
+          --second|--second-id)
+            second_instance_id="$2"
+            shift 2
+            ;;
+          *)
+            die "Unknown option: $1"
+            ;;
+        esac
+      done
+      [[ -n "$first_instance_id" && -n "$second_instance_id" ]] || die "instances swap requires --first <id> --second <id>"
+      local body
+      body="$(jq -n --arg first_instance_id "$first_instance_id" --arg second_instance_id "$second_instance_id" '{first_instance_id: $first_instance_id, second_instance_id: $second_instance_id}')"
+      api_request POST "/api/instances/swap" "$body" | jq .
+      ;;
     *)
-      die "Unknown instances subcommand: ${sub}. Use: list | stop"
+      die "Unknown instances subcommand: ${sub}. Use: list | stop | move | swap"
       ;;
   esac
 }

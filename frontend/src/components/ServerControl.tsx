@@ -14,7 +14,7 @@ import type {
   SystemGpuMetrics,
   SmokeTestResult,
 } from "@/types";
-import { Copy, Info, Play, StopCircle, RotateCcw, Terminal } from "lucide-react";
+import { ArrowRightLeft, Copy, Info, Play, StopCircle, RotateCcw, Terminal } from "lucide-react";
 
 interface ServerControlProps {
   status: ServerStatus | null;
@@ -296,6 +296,10 @@ export default function ServerControl({
   const [runningServers, setRunningServers] = useState<RunningServer[]>([]);
   const [stoppingPid, setStoppingPid] = useState<number | null>(null);
   const [stoppingInstanceId, setStoppingInstanceId] = useState<string | null>(null);
+  const [movingInstanceId, setMovingInstanceId] = useState<string | null>(null);
+  const [swappingInstances, setSwappingInstances] = useState<string[]>([]);
+  const [moveTargets, setMoveTargets] = useState<Record<string, string>>({});
+  const [swapTargets, setSwapTargets] = useState<Record<string, string>>({});
   const [copyMessage, setCopyMessage] = useState<string | null>(null);
   const [smokeTestingId, setSmokeTestingId] = useState<string | null>(null);
   const [smokeTestResults, setSmokeTestResults] = useState<Record<string, SmokeTestResult>>({});
@@ -445,6 +449,80 @@ export default function ServerControl({
       setResult({ success: false, message: String(err) });
     } finally {
       setStoppingInstanceId(null);
+    }
+  }
+
+  async function handleMoveInstance(server: RunningServer) {
+    if (!server.instance_id) return;
+    const instanceId = server.instance_id;
+    const target = (moveTargets[instanceId] || "").trim();
+    if (!target) {
+      setResult({ success: false, message: "移設先 GPU を入力してください（例: 2,3）。" });
+      setShowSteps(true);
+      return;
+    }
+    const confirmed = window.confirm(
+      `${server.instance_name || instanceId} を GPU ${
+        server.using_gpu_indices.length
+          ? server.using_gpu_indices.join(",")
+          : server.gpu_devices || "all"
+      } から GPU ${target} へ移設します。\n` +
+        "停止・再起動の間は推論できません。続行しますか？"
+    );
+    if (!confirmed) return;
+
+    setMovingInstanceId(instanceId);
+    setResult(null);
+    setShowSteps(true);
+    try {
+      const res = await api.moveInstance(instanceId, target);
+      setResult(res);
+      if (res.success) {
+        setMoveTargets((prev) => ({ ...prev, [instanceId]: "" }));
+      }
+      onActionComplete();
+      const data = await api.getRunningServers();
+      setRunningServers(data);
+    } catch (err) {
+      setResult({ success: false, message: String(err) });
+    } finally {
+      setMovingInstanceId(null);
+    }
+  }
+
+  async function handleSwapInstances(server: RunningServer) {
+    if (!server.instance_id) return;
+    const firstInstanceId = server.instance_id;
+    const secondInstanceId = (swapTargets[firstInstanceId] || "").trim();
+    if (!secondInstanceId) {
+      setResult({ success: false, message: "交換先インスタンスを選択してください。" });
+      setShowSteps(true);
+      return;
+    }
+    const secondServer = runningServers.find((item) => item.instance_id === secondInstanceId);
+    const confirmed = window.confirm(
+      `${server.instance_name || firstInstanceId}（GPU ${server.using_gpu_indices.join(",") || server.gpu_devices}）と\n` +
+        `${secondServer?.instance_name || secondInstanceId}（GPU ${secondServer?.using_gpu_indices.join(",") || secondServer?.gpu_devices || "不明"}）のGPUを入れ替えます。\n` +
+        "両方のサーバーは停止・再起動され、その間は推論できません。続行しますか？"
+    );
+    if (!confirmed) return;
+
+    setSwappingInstances([firstInstanceId, secondInstanceId]);
+    setResult(null);
+    setShowSteps(true);
+    try {
+      const res = await api.swapInstances(firstInstanceId, secondInstanceId);
+      setResult(res);
+      if (res.success) {
+        setSwapTargets((prev) => ({ ...prev, [firstInstanceId]: "" }));
+      }
+      onActionComplete();
+      const data = await api.getRunningServers();
+      setRunningServers(data);
+    } catch (err) {
+      setResult({ success: false, message: String(err) });
+    } finally {
+      setSwappingInstances([]);
     }
   }
 
@@ -773,7 +851,7 @@ export default function ServerControl({
                   ? "最低限（他プロセスと同居しやすい）"
                   : `${Math.round(form.gpu_memory_utilization * 100)}%`
             }`}
-            hint="vLLM の `--gpu-memory-utilization` に対応します。GPU 全体 VRAM に対して「KV キャッシュ等に使ってよい上限比率」のイメージです。自動はその時点の空き VRAM を目一杯（上限85%まで）確保します。最低限は指定した context 長 × 同時実行数に必要な分だけ確保するので、同じ GPU に他のモデルや学習ジョブを同居させたいときに有効です。"
+            hint="vLLM の `--gpu-memory-utilization` に対応します。GPU 全体 VRAM に対して「KV キャッシュ等に使ってよい上限比率」のイメージです。自動はその時点の空き VRAM を目一杯（上限85%まで）確保します。最低限は chat では指定した context 長 × 同時実行数、embedding/rerank ではモデル重みサイズと実行時余白から算出するので、同じ GPU に他のモデルや学習ジョブを同居させたいときに有効です。"
           />
           <div className="flex gap-4 text-sm mb-2 flex-wrap">
             <label className="flex items-center gap-2">
@@ -809,7 +887,7 @@ export default function ServerControl({
           </div>
           {form.gpu_memory_mode === "minimal" && (
             <p className="mt-1 mb-2 text-xs text-gray-500">
-              現在の設定（コンテキスト長 × 最大同時実行数）から必要な KV キャッシュ量を見積もって起動します。
+              chat は現在の設定（コンテキスト長 × 最大同時実行数）から KV キャッシュ量を、embedding/rerank はモデル重みサイズと実行時余白を見積もって起動します。
               モデル設定の取得に失敗した場合は自動モードにフォールバックします。
             </p>
           )}
@@ -1413,7 +1491,9 @@ export default function ServerControl({
           </button>
         </div>
         <p className="text-xs text-gray-500 mb-3">
-          このホストで動作中の `vllm serve` プロセスを表示します。複数起動時は一覧から個別に停止できます（LLM / embedding / rerank 混在可）。
+          このホストで動作中の `vllm serve` プロセスを表示します。管理対象プロセスは、移設先 GPU
+          を指定して同じ設定のまま停止・再起動できます（移設中は一時停止し、失敗時は元の GPU
+          への復旧を試みます）。
         </p>
         {copyMessage && <p className="mb-3 text-xs text-gray-400">{copyMessage}</p>}
         <div className="overflow-x-auto rounded-lg border border-white/10">
@@ -1509,9 +1589,97 @@ export default function ServerControl({
                   <td className="px-3 py-2">
                     <div className="flex flex-col gap-1">
                       {server.instance_id && server.managed_by_app && (
+                        <div className="mb-1 rounded-lg border border-white/10 bg-bg-primary/50 p-2">
+                          <label className="mb-1 block text-[10px] text-gray-400">
+                            移設先 GPU（{server.tensor_parallel_size ?? 1}台）
+                          </label>
+                          <input
+                            type="text"
+                            inputMode="numeric"
+                            value={moveTargets[server.instance_id] || ""}
+                            onChange={(e) =>
+                              setMoveTargets((prev) => ({
+                                ...prev,
+                                [server.instance_id!]: e.target.value,
+                              }))
+                            }
+                            disabled={movingInstanceId === server.instance_id}
+                            placeholder={
+                              (server.tensor_parallel_size ?? 1) > 1 ? "例: 2,3" : "例: 2"
+                            }
+                            aria-label={`${server.instance_name || server.instance_id} の移設先 GPU`}
+                            className="mb-1 w-28 rounded border border-white/10 bg-bg-tertiary px-2 py-1 text-xs text-white placeholder:text-gray-600 disabled:opacity-50"
+                          />
+                          <button
+                            onClick={() => handleMoveInstance(server)}
+                            disabled={
+                              movingInstanceId === server.instance_id ||
+                              !(moveTargets[server.instance_id] || "").trim()
+                            }
+                            className="flex w-full items-center justify-center gap-1 rounded-lg bg-amber-500/20 px-2 py-1.5 text-xs text-amber-300 hover:bg-amber-500/30 disabled:opacity-50"
+                          >
+                            <ArrowRightLeft className="h-3.5 w-3.5" />
+                            {movingInstanceId === server.instance_id ? "移設中..." : "GPU 移設"}
+                          </button>
+                          {gpuOptions.length > 0 && (
+                            <div className="mt-1 text-[10px] text-gray-500">
+                              利用可能: {gpuOptions.map((gpu) => gpu.index).join(", ")}
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      {server.instance_id && server.managed_by_app && (
+                        <div className="mb-1 rounded-lg border border-white/10 bg-bg-primary/50 p-2">
+                          <label className="mb-1 block text-[10px] text-gray-400">
+                            GPU交換先インスタンス
+                          </label>
+                          <select
+                            value={swapTargets[server.instance_id] || ""}
+                            onChange={(e) =>
+                              setSwapTargets((prev) => ({
+                                ...prev,
+                                [server.instance_id!]: e.target.value,
+                              }))
+                            }
+                            disabled={swappingInstances.includes(server.instance_id)}
+                            aria-label={`${server.instance_name || server.instance_id} のGPU交換先`}
+                            className="mb-1 w-full rounded border border-white/10 bg-bg-tertiary px-2 py-1 text-xs text-white disabled:opacity-50"
+                          >
+                            <option value="">交換先を選択</option>
+                            {runningServers
+                              .filter(
+                                (candidate) =>
+                                  candidate.instance_id &&
+                                  candidate.instance_id !== server.instance_id &&
+                                  candidate.managed_by_app
+                              )
+                              .map((candidate) => (
+                                <option key={candidate.instance_id!} value={candidate.instance_id ?? ""}>
+                                  {candidate.instance_name || candidate.instance_id}（GPU {candidate.using_gpu_indices.join(",") || candidate.gpu_devices}）
+                                </option>
+                              ))}
+                          </select>
+                          <button
+                            onClick={() => handleSwapInstances(server)}
+                            disabled={
+                              swappingInstances.includes(server.instance_id) ||
+                              !(swapTargets[server.instance_id] || "").trim()
+                            }
+                            className="flex w-full items-center justify-center gap-1 rounded-lg bg-sky-500/20 px-2 py-1.5 text-xs text-sky-300 hover:bg-sky-500/30 disabled:opacity-50"
+                          >
+                            <ArrowRightLeft className="h-3.5 w-3.5" />
+                            {swappingInstances.includes(server.instance_id) ? "GPU交換中..." : "GPU交換"}
+                          </button>
+                        </div>
+                      )}
+                      {server.instance_id && server.managed_by_app && (
                         <button
                           onClick={() => handleSmokeTest(server.instance_id!)}
-                          disabled={smokeTestingId === server.instance_id}
+                          disabled={
+                            smokeTestingId === server.instance_id ||
+                            movingInstanceId === server.instance_id ||
+                            swappingInstances.includes(server.instance_id)
+                          }
                           className="px-3 py-1.5 rounded-lg bg-accent-primary/20 hover:bg-accent-primary/30 text-accent-primary disabled:opacity-50 text-xs"
                         >
                           {smokeTestingId === server.instance_id ? "疎通確認中..." : "疎通テスト"}
@@ -1539,7 +1707,11 @@ export default function ServerControl({
                       {server.instance_id && server.managed_by_app && (
                         <button
                           onClick={() => handleStopByInstance(server.instance_id!)}
-                          disabled={stoppingInstanceId === server.instance_id}
+                          disabled={
+                            stoppingInstanceId === server.instance_id ||
+                            movingInstanceId === server.instance_id ||
+                            swappingInstances.includes(server.instance_id)
+                          }
                           className="px-3 py-1.5 rounded-lg bg-accent-danger/20 hover:bg-accent-danger/30 text-accent-danger disabled:opacity-50 text-xs"
                         >
                           {stoppingInstanceId === server.instance_id ? "停止中..." : "インスタンス停止"}
@@ -1547,7 +1719,9 @@ export default function ServerControl({
                       )}
                       <button
                         onClick={() => handleStopByPid(server.pid)}
-                        disabled={stoppingPid === server.pid}
+                        disabled={
+                          stoppingPid === server.pid || movingInstanceId === server.instance_id
+                        }
                         className="px-3 py-1.5 rounded-lg bg-accent-danger/20 hover:bg-accent-danger/30 text-accent-danger disabled:opacity-50 text-xs"
                       >
                         {stoppingPid === server.pid ? "停止中..." : "PID 停止"}
@@ -1585,8 +1759,10 @@ export default function ServerControl({
                 <span className="text-accent-primary">{">"}</span> {step}
               </div>
             ))}
-            {result.message && !result.steps?.length && (
-              <div>{result.message}</div>
+            {result.message && (
+              <div className={result.steps?.length ? "mt-2 border-t border-white/10 pt-2" : ""}>
+                {result.message}
+              </div>
             )}
           </div>
         </div>

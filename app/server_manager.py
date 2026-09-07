@@ -5,6 +5,7 @@ vLLM サーバーの起動/停止/ステータス管理を担う。
 Docker 環境内で動作することを前提としている。
 """
 
+import math
 import re
 import subprocess
 import time
@@ -52,6 +53,13 @@ CONTEXT_PRESETS = [
 MAX_NUM_SEQS_LIMIT = 20
 GPU_MEMORY_UTILIZATION_SAFE_MAX = 0.85
 GPU_MEMORY_MODES = frozenset({"auto", "manual", "minimal"})
+# pooling runner は KV cache を使わない一方、重み以外にも CUDA graph / workspace /
+# 一時 activation などのメモリを使う。大きい embedding/rerank モデルが
+# 「重み + 1.5 GiB」の丸めで一律 0.1 に落ちないよう、モデルサイズに比例した
+# 余白と最低余白を別々に持たせる。
+MINIMAL_POOLING_MARGIN_RATIO = 0.20
+MINIMAL_POOLING_MIN_MARGIN_BYTES = 3 * 1024**3
+MINIMAL_MEMORY_UTILIZATION_STEP = 0.01
 
 
 def _normalize_gpu_memory_mode(value: Any) -> str:
@@ -885,22 +893,66 @@ _MODEL_KV_BYTES_PER_TOKEN_CACHE: dict[str, Optional[int]] = {}
 _WEIGHT_FILE_SUFFIXES = (".safetensors", ".bin", ".gguf", ".pt")
 
 
+def _sum_local_model_weight_bytes(root: Path) -> Optional[int]:
+    """ローカルのモデルスナップショットにある重みファイルを合計する。"""
+    try:
+        if root.is_file() and root.suffix.lower() in _WEIGHT_FILE_SUFFIXES:
+            size = root.stat().st_size
+            return int(size) if size > 0 else None
+        if not root.is_dir():
+            return None
+        total = sum(
+            path.stat().st_size
+            for path in root.rglob("*")
+            if path.is_file() and path.suffix.lower() in _WEIGHT_FILE_SUFFIXES
+        )
+        return int(total) if total > 0 else None
+    except (OSError, ValueError):
+        return None
+
+
+def _cached_model_weight_bytes(model_id: str) -> Optional[int]:
+    """HF キャッシュまたはローカルパスから重みサイズを取得する。"""
+    if model_id:
+        local_path = Path(model_id).expanduser()
+        local_size = _sum_local_model_weight_bytes(local_path)
+        if local_size is not None:
+            return local_size
+
+    try:
+        snapshot_path = snapshot_download(
+            repo_id=model_id,
+            cache_dir=os.environ.get("HF_HOME", "/app/hf-cache"),
+            local_files_only=True,
+        )
+    except Exception:
+        return None
+    return _sum_local_model_weight_bytes(Path(snapshot_path))
+
+
 def _model_weight_bytes(model_id: str) -> Optional[int]:
-    """モデル重みの合計バイト数を、ダウンロードせず HF API のファイル一覧から見積もる。"""
+    """モデル重みの合計バイト数を、ダウンロードせずに見積もる。
+
+    まず実際に起動で使われるローカルキャッシュを確認し、未キャッシュの場合は
+    HF API のファイル一覧を使う。API のメタデータが取れない環境でも、モデルを
+    既にダウンロード済みなら minimal の計算を継続できる。
+    """
     if model_id in _MODEL_WEIGHT_BYTES_CACHE:
         return _MODEL_WEIGHT_BYTES_CACHE[model_id]
     result: Optional[int] = None
+    result = _cached_model_weight_bytes(model_id)
     try:
-        info = HfApi().model_info(model_id, files_metadata=True)
-        total = sum(
-            (getattr(s, "size", None) or 0)
-            for s in (info.siblings or [])
-            if s.rfilename.endswith(_WEIGHT_FILE_SUFFIXES)
-        )
-        if total > 0:
-            result = int(total)
+        if result is None:
+            info = HfApi().model_info(model_id, files_metadata=True)
+            total = sum(
+                (getattr(s, "size", None) or 0)
+                for s in (info.siblings or [])
+                if str(s.rfilename).lower().endswith(_WEIGHT_FILE_SUFFIXES)
+            )
+            if total > 0:
+                result = int(total)
     except Exception:
-        result = None
+        pass
     _MODEL_WEIGHT_BYTES_CACHE[model_id] = result
     return result
 
@@ -945,8 +997,9 @@ def _minimal_gpu_memory_plan(config: dict) -> tuple[Optional[float], Optional[in
     明示している前提）。
     embedding/rerank（pooling runner）: vLLM は生成のための KV キャッシュを
     実質使わない（実測でも --kv-cache-memory の要求量をほぼ無視し、重みサイズ
-    相当しか使わない）。そのため KV 計算はスキップし、重みサイズのみから
-    gpu_memory_utilization を決める（--kv-cache-memory は付与しない）。
+    相当しか使わない）。そのため KV 計算はスキップし、重みサイズと pooling
+    実行時の安全余白から gpu_memory_utilization を決める
+    （--kv-cache-memory は付与しない）。
     見積もりに必要な情報が取れない場合は auto モードにフォールバックさせる。
     """
     model_id = str(config.get("model_id", ""))
@@ -976,17 +1029,34 @@ def _minimal_gpu_memory_plan(config: dict) -> tuple[Optional[float], Optional[in
     tp = max(1, int(config.get("tensor_parallel_size", 1)))
     total_mb = None
     if selected:
+        if tp > len(selected):
+            return None, None, (
+                f"tensor_parallel_size={tp} に対して利用可能GPU数が不足しています "
+                f"(選択GPU: {len(selected)})。"
+            )
         target_gpus = selected[:tp]
         # tensor_parallel_size > 1 では重み・KVキャッシュは GPU 間で分割される想定
         total_mb = min(inventory[i]["total_mb"] for i in target_gpus)
 
-    # 重み + KV キャッシュ + アクティベーション等の安全マージン（+15%、最低1.5GiB）
-    required_bytes = weight_bytes / max(1, tp) + kv_cache_bytes
-    margin_bytes = max(int(required_bytes * 0.15), 1_500_000_000)
+    weight_bytes_per_gpu = math.ceil(weight_bytes / max(1, tp))
+    required_bytes = weight_bytes_per_gpu + kv_cache_bytes
+    if task_type in POOLING_TASK_TYPES:
+        # 旧式の「重み + 最低1.5GB」だけだと、98GB GPU 上では 1GB と 8GB
+        # のモデルがどちらも 0.1 に丸められる。大きいモデルほど必要になる
+        # profile/workspace 分を比例で加え、最低限の固定余白も確保する。
+        margin_bytes = max(
+            math.ceil(required_bytes * MINIMAL_POOLING_MARGIN_RATIO),
+            MINIMAL_POOLING_MIN_MARGIN_BYTES,
+        )
+    else:
+        # chat は従来どおり、重み + KV キャッシュに対する安全マージン。
+        margin_bytes = max(int(required_bytes * 0.15), 1_500_000_000)
     required_bytes += margin_bytes
 
     if total_mb:
         util = required_bytes / (total_mb * 1024 * 1024)
+        # 切り捨てになり得る round() ではなく、必要量を下回らないよう切り上げる。
+        util = math.ceil(util / MINIMAL_MEMORY_UTILIZATION_STEP) * MINIMAL_MEMORY_UTILIZATION_STEP
         util = max(0.1, min(GPU_MEMORY_UTILIZATION_SAFE_MAX, round(util, 2)))
     else:
         util = GPU_MEMORY_UTILIZATION_SAFE_MAX
@@ -1194,7 +1264,8 @@ def start_server(
                 )
             else:
                 result["steps"].append(
-                    f"最低限モード: embedding/rerank は KV キャッシュ不要のため重みサイズのみで算出"
+                    f"最低限モード: embedding/rerank は KV キャッシュ不要のため"
+                    f"重みサイズ + pooling 実行時余白から算出"
                     f"（上限 gpu_memory_utilization={minimal_util}）"
                 )
     if gpu_memory_mode == "auto":
@@ -1404,6 +1475,422 @@ def _config_start_kwargs(config: dict[str, Any]) -> dict[str, Any]:
         "max_lora_rank",
     )
     return {k: config[k] for k in keys if k in config}
+
+
+def _validate_move_target(
+    gpu_devices: str,
+    *,
+    tensor_parallel_size: int,
+    inventory: dict[int, dict[str, float]],
+) -> tuple[Optional[str], list[int], Optional[str]]:
+    """移設先 GPU 指定を正規化し、(文字列, index一覧, エラー) を返す。"""
+    normalized = re.sub(r"\s+", "", str(gpu_devices or ""))
+    if not normalized or normalized.lower() == "all":
+        return None, [], "移設先 GPU は `2,3` のように番号で明示してください（`all` は使用できません）。"
+    if not re.fullmatch(r"\d+(?:,\d+)*", normalized):
+        return None, [], "移設先 GPU は `2,3` のようなカンマ区切りの番号で指定してください。"
+
+    indices = [int(raw) for raw in normalized.split(",")]
+    if len(indices) != len(set(indices)):
+        return None, [], "移設先 GPU に同じ番号を複数回指定することはできません。"
+    if len(indices) != tensor_parallel_size:
+        return None, [], (
+            f"tensor_parallel_size={tensor_parallel_size} のインスタンスには、"
+            f"移設先 GPU をちょうど {tensor_parallel_size} 台指定してください。"
+        )
+
+    missing = [index for index in indices if index not in inventory]
+    if missing:
+        missing_text = ",".join(str(index) for index in missing)
+        return None, [], f"移設先 GPU が見つかりません: {missing_text}"
+    return ",".join(str(index) for index in indices), indices, None
+
+
+def _preflight_move_config(config: dict[str, Any]) -> Optional[str]:
+    """移設元を止める前に、起動時と同じメモリ計画で移設先を検査する。"""
+    planned = dict(config)
+    gpu_memory_mode = _normalize_gpu_memory_mode(planned.get("gpu_memory_mode"))
+    planned.pop("_kv_cache_memory_bytes", None)
+
+    if gpu_memory_mode == "minimal":
+        minimal_util, minimal_kv_bytes, minimal_error = _minimal_gpu_memory_plan(planned)
+        if minimal_error:
+            gpu_memory_mode = "auto"
+        else:
+            planned["gpu_memory_utilization"] = minimal_util
+            if minimal_kv_bytes:
+                planned["_kv_cache_memory_bytes"] = minimal_kv_bytes
+    if gpu_memory_mode == "auto":
+        auto_util, auto_error = _auto_gpu_memory_utilization(planned)
+        if auto_error:
+            return auto_error
+        if auto_util is not None:
+            planned["gpu_memory_utilization"] = auto_util
+
+    return _preflight_vram_check(planned)
+
+
+def move_instance(instance_id: str, gpu_devices: str) -> dict[str, Any]:
+    """稼働中の管理対象インスタンスを別 GPU へ停止・再起動で移設する。
+
+    vLLM の CUDA コンテキストは実行中に別 GPU へ移せないため再起動が必要になる。
+    移設先の検査は停止前に行い、移設先で起動できなかった場合は元の GPU での
+    再起動を試みる。
+    """
+    result: dict[str, Any] = {
+        "success": False,
+        "message": "",
+        "steps": [],
+        "instance_id": instance_id,
+        "source_gpu_devices": None,
+        "target_gpu_devices": None,
+        "rollback_attempted": False,
+        "rollback_success": None,
+    }
+
+    if _sanitize_instance_id(instance_id) != instance_id:
+        result["message"] = "instance_id が不正です。"
+        return result
+    if _registry_entry_for(instance_id) is None:
+        result["message"] = f"管理対象インスタンス {instance_id} が見つかりません。"
+        return result
+
+    status = get_instance_status(instance_id)
+    if not status.get("running"):
+        result["message"] = f"インスタンス {instance_id} は起動していないため移設できません。"
+        return result
+
+    config = load_config(instance_id)
+    configured_source_gpu_devices = str(config.get("gpu_devices") or "all").strip()
+    tensor_parallel_size = max(1, int(config.get("tensor_parallel_size", 1)))
+
+    inventory = _read_gpu_inventory()
+    if not inventory:
+        result["message"] = "GPU 情報を取得できないため、安全に移設できません。"
+        return result
+    target_gpu_devices, target_indices, target_error = _validate_move_target(
+        gpu_devices,
+        tensor_parallel_size=tensor_parallel_size,
+        inventory=inventory,
+    )
+    if target_error or target_gpu_devices is None:
+        result["message"] = target_error or "移設先 GPU の指定が不正です。"
+        return result
+    result["target_gpu_devices"] = target_gpu_devices
+
+    source_indices: list[int] = []
+    try:
+        source_pid = int(status.get("pid"))
+    except (TypeError, ValueError):
+        source_pid = 0
+    if source_pid > 0:
+        detected_source_indices = _gpu_indices_for_process_tree(source_pid)
+        if len(detected_source_indices) >= tensor_parallel_size:
+            source_indices = detected_source_indices[:tensor_parallel_size]
+    if not source_indices:
+        source_indices = _selected_gpu_order(
+            configured_source_gpu_devices, inventory
+        )[:tensor_parallel_size]
+    source_gpu_devices = (
+        ",".join(str(index) for index in source_indices)
+        if source_indices
+        else configured_source_gpu_devices
+    )
+    result["source_gpu_devices"] = source_gpu_devices
+
+    overlap = sorted(set(source_indices) & set(target_indices))
+    if overlap:
+        result["message"] = (
+            "移設元と移設先に同じ GPU が含まれています: "
+            + ",".join(str(index) for index in overlap)
+            + "。稼働中の移設元と重ならない GPU を指定してください。"
+        )
+        return result
+
+    target_config = dict(config)
+    target_config["gpu_devices"] = target_gpu_devices
+    preflight_error = _preflight_move_config(target_config)
+    if preflight_error:
+        result["message"] = f"移設先 GPU の事前チェックに失敗しました。詳細: {preflight_error}"
+        result["steps"].append("移設元は停止していません。")
+        return result
+
+    result["steps"].append(
+        f"移設先チェック完了: GPU {target_gpu_devices} (tensor_parallel_size={tensor_parallel_size})"
+    )
+    stop_result = stop_instance(instance_id)
+    result["steps"].append(f"移設元を停止: {stop_result.get('message', '')}")
+    if not stop_result.get("success"):
+        result["message"] = "移設元インスタンスを停止できなかったため、移設を中止しました。"
+        return result
+
+    start_kwargs = _config_start_kwargs(config)
+    start_kwargs["gpu_devices"] = target_gpu_devices
+    start_result = start_server(
+        **start_kwargs,
+        instance_id=instance_id,
+        instance_name=config.get("instance_name"),
+        vllm_port=config.get("vllm_port"),
+        create_new_instance=True,
+        download_model=False,
+    )
+    result["steps"].extend(
+        f"移設先: {step}" for step in start_result.get("steps", [])
+    )
+    if start_result.get("success"):
+        result["success"] = True
+        result["message"] = (
+            f"インスタンス {instance_id} を GPU {source_gpu_devices} から "
+            f"GPU {target_gpu_devices} へ移設しました。"
+        )
+        return result
+
+    result["rollback_attempted"] = True
+    result["steps"].append(
+        f"移設先で起動できなかったため、元の GPU {source_gpu_devices} で再起動します。"
+    )
+    rollback_kwargs = _config_start_kwargs(config)
+    rollback_kwargs["gpu_devices"] = source_gpu_devices
+    rollback_result = start_server(
+        **rollback_kwargs,
+        instance_id=instance_id,
+        instance_name=config.get("instance_name"),
+        vllm_port=config.get("vllm_port"),
+        create_new_instance=True,
+        download_model=False,
+    )
+    result["rollback_success"] = bool(rollback_result.get("success"))
+    result["steps"].extend(
+        f"ロールバック: {step}" for step in rollback_result.get("steps", [])
+    )
+    if rollback_result.get("success"):
+        result["message"] = (
+            f"GPU {target_gpu_devices} への移設に失敗しましたが、"
+            f"インスタンス {instance_id} は元の GPU {source_gpu_devices} で再起動しました。"
+            f" 移設エラー: {start_result.get('message', '')}"
+        )
+    else:
+        result["message"] = (
+            f"GPU {target_gpu_devices} への移設と GPU {source_gpu_devices} へのロールバックの"
+            "両方に失敗しました。ログを確認して手動で起動してください。"
+            f" 移設エラー: {start_result.get('message', '')}; "
+            f"ロールバックエラー: {rollback_result.get('message', '')}"
+        )
+    return result
+
+
+def _resolve_running_instance_gpu_devices(
+    status: dict[str, Any],
+    config: dict[str, Any],
+    inventory: dict[int, dict[str, float]],
+) -> tuple[Optional[str], list[int], Optional[str]]:
+    """稼働中インスタンスが実際に使用している GPU を解決する。"""
+    tensor_parallel_size = max(1, int(config.get("tensor_parallel_size", 1)))
+    try:
+        pid = int(status.get("pid"))
+    except (TypeError, ValueError):
+        pid = 0
+
+    indices: list[int] = []
+    if pid > 0:
+        detected = _gpu_indices_for_process_tree(pid)
+        if len(detected) >= tensor_parallel_size:
+            indices = detected[:tensor_parallel_size]
+    if not indices:
+        configured = str(config.get("gpu_devices") or "all").strip()
+        indices = _selected_gpu_order(configured, inventory)[:tensor_parallel_size]
+
+    if len(indices) != tensor_parallel_size:
+        return None, [], (
+            f"稼働中インスタンスの使用GPUを特定できませんでした "
+            f"(tensor_parallel_size={tensor_parallel_size})。"
+        )
+    missing = [index for index in indices if index not in inventory]
+    if missing:
+        return None, [], "使用中GPUが見つかりません: " + ",".join(str(index) for index in missing)
+    return ",".join(str(index) for index in indices), indices, None
+
+
+def _start_instance_on_gpu(config: dict[str, Any], gpu_devices: str) -> dict[str, Any]:
+    """保存済み設定を保ったまま、指定GPUでインスタンスを起動する。"""
+    start_kwargs = _config_start_kwargs(config)
+    start_kwargs["gpu_devices"] = gpu_devices
+    return start_server(
+        **start_kwargs,
+        instance_id=str(config.get("instance_id") or ""),
+        instance_name=config.get("instance_name"),
+        vllm_port=config.get("vllm_port"),
+        create_new_instance=True,
+        download_model=False,
+    )
+
+
+def swap_instances(first_instance_id: str, second_instance_id: str) -> dict[str, Any]:
+    """2つの稼働中インスタンスが使う GPU を相互に入れ替える。
+
+    vLLM の CUDA コンテキストは実行中に移せないため、両方を停止してから
+    相互の GPU 設定で再起動する。どちらかの起動に失敗した場合は、両方を
+    元の GPU へ戻す。
+    """
+    result: dict[str, Any] = {
+        "success": False,
+        "message": "",
+        "steps": [],
+        "first_instance_id": first_instance_id,
+        "second_instance_id": second_instance_id,
+        "first_source_gpu_devices": None,
+        "second_source_gpu_devices": None,
+        "rollback_attempted": False,
+        "rollback_success": None,
+    }
+
+    if (
+        _sanitize_instance_id(first_instance_id) != first_instance_id
+        or _sanitize_instance_id(second_instance_id) != second_instance_id
+    ):
+        result["message"] = "instance_id が不正です。"
+        return result
+    if first_instance_id == second_instance_id:
+        result["message"] = "同じインスタンス同士はスワップできません。"
+        return result
+
+    for instance_id in (first_instance_id, second_instance_id):
+        if _registry_entry_for(instance_id) is None:
+            result["message"] = f"管理対象インスタンス {instance_id} が見つかりません。"
+            return result
+
+    first_status = get_instance_status(first_instance_id)
+    second_status = get_instance_status(second_instance_id)
+    if not first_status.get("running") or not second_status.get("running"):
+        result["message"] = "GPUスワップには両方のインスタンスが起動している必要があります。"
+        return result
+
+    first_config = load_config(first_instance_id)
+    second_config = load_config(second_instance_id)
+    first_config["instance_id"] = first_instance_id
+    second_config["instance_id"] = second_instance_id
+    first_tp = max(1, int(first_config.get("tensor_parallel_size", 1)))
+    second_tp = max(1, int(second_config.get("tensor_parallel_size", 1)))
+    if first_tp != second_tp:
+        result["message"] = (
+            "GPUスワップには同じ tensor_parallel_size のインスタンスが必要です "
+            f"(first={first_tp}, second={second_tp})。"
+        )
+        return result
+
+    inventory = _read_gpu_inventory()
+    if not inventory:
+        result["message"] = "GPU 情報を取得できないため、安全にスワップできません。"
+        return result
+
+    first_source, first_indices, first_error = _resolve_running_instance_gpu_devices(
+        first_status, first_config, inventory
+    )
+    second_source, second_indices, second_error = _resolve_running_instance_gpu_devices(
+        second_status, second_config, inventory
+    )
+    if first_error or second_error or first_source is None or second_source is None:
+        result["message"] = first_error or second_error or "使用GPUを特定できませんでした。"
+        return result
+    result["first_source_gpu_devices"] = first_source
+    result["second_source_gpu_devices"] = second_source
+
+    overlap = sorted(set(first_indices) & set(second_indices))
+    if overlap:
+        result["message"] = (
+            "2つのインスタンスが同じGPUを使用しているためスワップできません: "
+            + ",".join(str(index) for index in overlap)
+        )
+        return result
+
+    first_target_config = dict(first_config)
+    first_target_config["gpu_devices"] = second_source
+    second_target_config = dict(second_config)
+    second_target_config["gpu_devices"] = first_source
+
+    stop_first = stop_instance(first_instance_id)
+    result["steps"].append(f"{first_instance_id} を停止: {stop_first.get('message', '')}")
+    if not stop_first.get("success"):
+        result["message"] = "1つ目のインスタンスを停止できなかったため、スワップを中止しました。"
+        return result
+
+    stop_second = stop_instance(second_instance_id)
+    result["steps"].append(f"{second_instance_id} を停止: {stop_second.get('message', '')}")
+
+    def restore_originals(
+        *, restore_first: bool = True, restore_second: bool = True
+    ) -> tuple[bool, list[str]]:
+        restore_steps: list[str] = []
+        first_ok = True
+        second_ok = True
+        if restore_first:
+            first_restore = _start_instance_on_gpu(first_config, first_source)
+            first_ok = bool(first_restore.get("success"))
+            restore_steps.extend(
+                f"ロールバック({first_instance_id}): {step}"
+                for step in first_restore.get("steps", [])
+            )
+        if restore_second:
+            second_restore = _start_instance_on_gpu(second_config, second_source)
+            second_ok = bool(second_restore.get("success"))
+            restore_steps.extend(
+                f"ロールバック({second_instance_id}): {step}"
+                for step in second_restore.get("steps", [])
+            )
+        return first_ok and second_ok, restore_steps
+
+    if not stop_second.get("success"):
+        result["rollback_attempted"] = True
+        # stop_instance がエラーを返しても、プロセスが停止済みの可能性がある。
+        # 稼働状態を再確認し、必要なインスタンスだけを復旧する。
+        second_still_running = bool(get_instance_status(second_instance_id).get("running"))
+        rollback_success, restore_steps = restore_originals(
+            restore_second=not second_still_running
+        )
+        result["rollback_success"] = rollback_success
+        result["steps"].extend(restore_steps)
+        result["message"] = "2つ目のインスタンスを停止できなかったため、元のGPUへ復旧を試みました。"
+        return result
+
+    first_preflight_error = _preflight_move_config(first_target_config)
+    second_preflight_error = _preflight_move_config(second_target_config)
+    if first_preflight_error or second_preflight_error:
+        result["rollback_attempted"] = True
+        rollback_success, restore_steps = restore_originals()
+        result["rollback_success"] = rollback_success
+        result["steps"].extend(restore_steps)
+        detail = first_preflight_error or second_preflight_error
+        result["message"] = f"スワップ先の事前チェックに失敗しました: {detail}"
+        return result
+
+    first_start = _start_instance_on_gpu(first_target_config, second_source)
+    result["steps"].extend(f"{first_instance_id} をGPU {second_source}で起動: {step}" for step in first_start.get("steps", []))
+    if not first_start.get("success"):
+        result["rollback_attempted"] = True
+        rollback_success, restore_steps = restore_originals()
+        result["rollback_success"] = rollback_success
+        result["steps"].extend(restore_steps)
+        result["message"] = "1つ目のスワップ先起動に失敗しました。元のGPUへ復旧を試みました。"
+        return result
+
+    second_start = _start_instance_on_gpu(second_target_config, first_source)
+    result["steps"].extend(f"{second_instance_id} をGPU {first_source}で起動: {step}" for step in second_start.get("steps", []))
+    if second_start.get("success"):
+        result["success"] = True
+        result["message"] = (
+            f"{first_instance_id} (GPU {first_source}) と "
+            f"{second_instance_id} (GPU {second_source}) のGPUを相互にスワップしました。"
+        )
+        return result
+
+    result["rollback_attempted"] = True
+    stop_first_target = stop_instance(first_instance_id)
+    result["steps"].append(f"スワップ途中の{first_instance_id}を停止: {stop_first_target.get('message', '')}")
+    rollback_success, restore_steps = restore_originals()
+    result["rollback_success"] = rollback_success
+    result["steps"].extend(restore_steps)
+    result["message"] = "2つ目のスワップ先起動に失敗しました。元のGPUへ復旧を試みました。"
+    return result
 
 
 def restore_managed_instances() -> list[dict[str, Any]]:
@@ -1672,6 +2159,57 @@ def _read_gpu_uuid_to_info() -> dict[str, dict[str, Any]]:
     return info
 
 
+def _process_tree_pids(root_pid: int) -> set[int]:
+    """vLLM launcher と EngineCore 等の子孫 PID を返す。"""
+    pids = {root_pid}
+    try:
+        import psutil
+
+        root = psutil.Process(root_pid)
+        pids.update(child.pid for child in root.children(recursive=True))
+    except Exception:
+        pass
+    return pids
+
+
+def _gpu_usage_for_process_tree(
+    root_pid: int,
+    usage_by_pid: dict[int, dict[str, Any]],
+) -> dict[str, Any]:
+    """親 vLLM と子 EngineCore の nvidia-smi 使用量をまとめる。"""
+    aggregated: dict[str, Any] = {
+        "total_vram_mb": 0.0,
+        "gpu_uuids": [],
+        "vram_by_gpu_uuid_mb": {},
+    }
+    seen_uuids: set[str] = set()
+    for pid in _process_tree_pids(root_pid):
+        usage = usage_by_pid.get(pid)
+        if not usage:
+            continue
+        aggregated["total_vram_mb"] += float(usage.get("total_vram_mb", 0.0))
+        for uuid, used_mb in usage.get("vram_by_gpu_uuid_mb", {}).items():
+            aggregated["vram_by_gpu_uuid_mb"][uuid] = (
+                float(aggregated["vram_by_gpu_uuid_mb"].get(uuid, 0.0)) + float(used_mb)
+            )
+            if uuid not in seen_uuids:
+                seen_uuids.add(uuid)
+                aggregated["gpu_uuids"].append(uuid)
+    return aggregated
+
+
+def _gpu_indices_for_process_tree(root_pid: int) -> list[int]:
+    """vLLM の子プロセスを含め、実際に VRAM を使用中の物理 GPU 番号を返す。"""
+    usage = _gpu_usage_for_process_tree(root_pid, _read_gpu_process_memory_by_pid())
+    info_by_uuid = _read_gpu_uuid_to_info()
+    indices = [
+        int(info_by_uuid[uuid]["index"])
+        for uuid in usage.get("gpu_uuids", [])
+        if uuid in info_by_uuid
+    ]
+    return sorted(set(indices))
+
+
 def list_running_servers() -> list[dict[str, Any]]:
     """実行中の vLLM サーバープロセス一覧を取得する。"""
     try:
@@ -1722,8 +2260,8 @@ def list_running_servers() -> list[dict[str, Any]]:
                 owner = None
             container_id, cgroup_path = _extract_container_from_cgroup(proc.info["pid"])
 
-            process_gpu_usage = gpu_usage_by_pid.get(
-                proc.info["pid"], {"total_vram_mb": 0.0, "gpu_uuids": [], "vram_by_gpu_uuid_mb": {}}
+            process_gpu_usage = _gpu_usage_for_process_tree(
+                proc.info["pid"], gpu_usage_by_pid
             )
             used_gpu_indices: list[int] = []
             vram_by_gpu_mb: dict[str, float] = {}

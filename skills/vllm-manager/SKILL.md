@@ -240,9 +240,12 @@ How it sizes VRAM (no manual percentage guessing needed):
   + ~15% margin. Measured example: 9B FP8 model, ctx=8192, 4 concurrent →
   **16.5 GB** total (vs. ~80 GB+ under `auto` on a mostly-free GPU).
 - **embedding/rerank** (pooling runner): vLLM doesn't really use a KV cache
-  for pooling, so this sizes from **model weight bytes only** — no
-  `--kv-cache-memory` is passed. Measured: `BAAI/bge-m3` → ~2.1 GB (≈ its
-  weight size almost exactly).
+  for pooling, so this sizes from **model weight bytes plus a runtime safety
+  margin** — no `--kv-cache-memory` is passed. The margin has both a fixed
+  minimum and a weight-proportional part, and the resulting utilization is
+  rounded up. This keeps a small model such as `BAAI/bge-m3` near its weight
+  size while giving a larger model such as an 8GB embedding model more than
+  the 0.1 lower bound.
 - If model config/weights can't be resolved (network issue, gated repo),
   falls back to `auto` and reports why in the start response `steps`.
 
@@ -279,7 +282,8 @@ Names containing `rerank` that were saved as embedding are auto-migrated on back
 9. On multi-GPU hosts pass explicit `gpu_devices` at start (`"all"` grabs GPU 0 and may OOM).
 10. Training / storage ops → admin PAT + `training ...` / `storage ...` CLI commands (or `/api/training/*`, `/api/storage*`).
 11. Want a model to coexist with others on a GPU (not hog it) → `gpu_memory_mode: "minimal"` in `--json` at start, not manual utilization guessing.
-12. Do not commit tokens (PAT file and litellm-key are separate).
+12. Need to exchange two running managed instances between GPUs → `instances swap --first <id> --second <id>`; both are stopped and restarted, with rollback attempted on failure.
+13. Do not commit tokens (PAT file and litellm-key are separate).
 
 ## Defaults
 

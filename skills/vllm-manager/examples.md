@@ -231,7 +231,8 @@ $CLI start Qwen/Qwen2.5-7B-Instruct --context-length 8192 --no-download \
   --json '{"gpu_devices":"1","gpu_memory_mode":"minimal","max_num_seqs":4}'
 # -> steps report the computed KV cache GiB + utilization ceiling used
 
-# embedding/rerank: sized from model weight bytes only (no KV cache needed)
+# embedding/rerank: sized from model weight bytes + pooling runtime margin
+# (no KV cache needed)
 $CLI models register jinaai/jina-embeddings-v3 --task-type embedding --context-length 8192
 $CLI start jinaai/jina-embeddings-v3 --task-type embedding --context-length 8192 --no-download \
   --instance-name embed-minimal \

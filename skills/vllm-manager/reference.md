@@ -98,6 +98,7 @@ Also available in UI (マイページ / ユーザ管理) and `POST /api/auth/me/
 | POST | `/api/stop` | admin | Stop default instance |
 | POST | `/api/instances/stop` | admin | Body `{ "instance_id": "..." }` |
 | POST | `/api/instances/{id}/smoke-test` | admin | chat / embeddings / score by task_type |
+| POST | `/api/instances/swap` | admin | 相互にGPUを入れ替えて2インスタンスを再起動 |
 | GET | `/api/models` | any | Catalog |
 | POST | `/api/models` | admin | Register / upsert (`task_type`: chat\|embedding\|rerank) |
 | DELETE | `/api/models/{id}` | admin | Remove catalog + cache |
@@ -140,9 +141,9 @@ Additional fields: `gpu_devices` (`"1"` etc.; prefer explicit on multi-GPU hosts
 |-------|----------|
 | `auto` (default) | Grabs free VRAM up to 85% of total, regardless of model size. Maximizes throughput for one dominant model on a GPU. |
 | `manual` | You set `gpu_memory_utilization` (0.1–0.85) directly. |
-| `minimal` | Sizes to what the model + your `context_length`/`max_num_seqs` actually need, via vLLM's `--kv-cache-memory` (exact bytes) for `chat`, or weight-size-only for `embedding`/`rerank` (pooling doesn't really use a KV cache). Falls back to `auto` if model config/weights can't be resolved (reported in start response `steps`). Use to co-locate multiple models/training jobs on one GPU. |
+| `minimal` | Sizes to what the model + your `context_length`/`max_num_seqs` actually need, via vLLM's `--kv-cache-memory` (exact bytes) for `chat`, or model-weight size plus pooling runtime margin for `embedding`/`rerank` (pooling doesn't really use a KV cache). The value is rounded up, so larger pooling models do not all collapse to the 0.1 lower bound. Falls back to `auto` if model config/weights can't be resolved (reported in start response `steps`). Use to co-locate multiple models/training jobs on one GPU. |
 
-Measured: 9B FP8 chat model, ctx=8192, 4 concurrent → 16.5 GB under `minimal` vs. 80+ GB under `auto` on a mostly-free GPU. `BAAI/bge-m3` embedding → ~2.1 GB under `minimal` (≈ its own weight size).
+Measured: 9B FP8 chat model, ctx=8192, 4 concurrent → 16.5 GB under `minimal` vs. 80+ GB under `auto` on a mostly-free GPU. Pooling models are sized from their weight bytes plus a runtime margin; `BAAI/bge-m3` remains near its own weight size, while larger models receive a proportionally larger utilization ceiling.
 
 ## Inference paths (backend proxy `:18000`)
 

@@ -12,6 +12,53 @@
 - 空きポートは起動時に自動採番されます（8001 から順に）。
 - `/v1/models` は **全稼働 vLLM のモデルを集約**して返します（LiteLLM キーのモデル許可フィルタは従来どおり）。
 
+### 稼働中インスタンスの GPU 移設
+
+管理画面の「起動中サーバー一覧」で、管理対象インスタンスに移設先 GPU を入力して
+「GPU 移設」を押すと、モデルや推論設定を保ったまま別 GPU で再起動できます。
+たとえば `tensor_parallel_size=2` で GPU `0,1` を使用中なら、移設先には `2,3` のように
+ちょうど2台を指定します。
+
+- vLLM の CUDA コンテキストは実行中に移せないため、停止・再起動の間は推論できません。
+- 移設先 GPU は移設元と重複できません。
+- 移設元を止める前に、GPU の存在、台数、空き VRAM を検査します。
+- 移設先で起動直後に失敗した場合は、元の GPU での再起動を自動的に試みます。
+- アプリ外から起動した vLLM プロセスは対象外です。
+
+CLI からは次のように実行できます。
+
+```bash
+./scripts/vllm-cli.sh instances move --id chat-main --gpus 2,3
+```
+
+GPU 0 上のインスタンスと GPU 1 上のインスタンスを相互に入れ替える場合は、
+次のスワップ操作を使えます。両方を停止してから相互の GPU で再起動するため、
+処理中は両方とも一時停止します。起動に失敗した場合は元の GPU への復旧を試みます。
+
+```bash
+./scripts/vllm-cli.sh instances swap --first instance-gpu0 --second instance-gpu1
+```
+
+管理対象で、両方が稼働中、かつ `tensor_parallel_size` が同じインスタンス同士が対象です。
+
+API のリクエスト例:
+
+```bash
+curl -X POST http://localhost:18000/api/instances/chat-main/move \
+  -H "Authorization: Bearer $VLLM_MANAGER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"gpu_devices":"2,3"}'
+```
+
+スワップ API:
+
+```bash
+curl -X POST http://localhost:18000/api/instances/swap \
+  -H "Authorization: Bearer $VLLM_MANAGER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"first_instance_id":"instance-gpu0","second_instance_id":"instance-gpu1"}'
+```
+
 ## 埋め込みモデル（embedding）
 
 | 項目 | 内容 |

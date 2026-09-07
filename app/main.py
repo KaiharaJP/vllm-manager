@@ -21,6 +21,8 @@ from app.server_manager import (
     start_server,
     stop_server,
     stop_instance,
+    move_instance,
+    swap_instances,
     stop_server_by_pid,
     restart_server,
     get_log_lines,
@@ -220,6 +222,15 @@ def _resolve_start_request(req: ServerStartRequest, catalog_entry: dict[str, Any
 
 class StopInstanceRequest(BaseModel):
     instance_id: str = Field(min_length=1, max_length=64)
+
+
+class MoveInstanceRequest(BaseModel):
+    gpu_devices: str = Field(min_length=1, max_length=64)
+
+
+class SwapInstancesRequest(BaseModel):
+    first_instance_id: str = Field(min_length=1, max_length=64)
+    second_instance_id: str = Field(min_length=1, max_length=64)
 
 
 class ServerStatusResponse(BaseModel):
@@ -1013,6 +1024,69 @@ async def api_stop_instance(req: StopInstanceRequest, admin: dict = Depends(requ
         "server_job",
         {"status": "stopped", "result": result, "instance_id": req.instance_id},
         message=result["message"],
+        actor=admin["username"],
+    )
+    return result
+
+
+@router.post("/api/instances/{instance_id}/move")
+async def api_move_instance(
+    instance_id: str,
+    req: MoveInstanceRequest,
+    admin: dict = Depends(require_admin),
+):
+    """稼働中の管理対象インスタンスを別 GPU へ停止・再起動で移設する。"""
+    await event_bus.publish(
+        "server_job",
+        {
+            "status": "moving",
+            "instance_id": instance_id,
+            "target_gpu_devices": req.gpu_devices,
+        },
+        actor=admin["username"],
+    )
+    result = move_instance(instance_id, req.gpu_devices)
+    await event_bus.publish(
+        "server_job",
+        {
+            "status": "completed" if result.get("success") else "failed",
+            "operation": "move",
+            "result": result,
+            "instance_id": instance_id,
+        },
+        message=result.get("message", ""),
+        actor=admin["username"],
+    )
+    return result
+
+
+@router.post("/api/instances/swap")
+async def api_swap_instances(
+    req: SwapInstancesRequest,
+    admin: dict = Depends(require_admin),
+):
+    """2つの管理対象インスタンスが使用するGPUを相互に入れ替える。"""
+    await event_bus.publish(
+        "server_job",
+        {
+            "status": "swapping",
+            "operation": "swap",
+            "first_instance_id": req.first_instance_id,
+            "second_instance_id": req.second_instance_id,
+        },
+        actor=admin["username"],
+    )
+    result = swap_instances(req.first_instance_id, req.second_instance_id)
+    await event_bus.publish(
+        "server_job",
+        {
+            "status": "completed" if result.get("success") else "failed",
+            "operation": "swap",
+            "result": result,
+            "first_instance_id": req.first_instance_id,
+            "second_instance_id": req.second_instance_id,
+        },
+        message=result.get("message", ""),
         actor=admin["username"],
     )
     return result

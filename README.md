@@ -335,6 +335,7 @@ docker compose up -d backend
 - `POST /api/start` - vLLM 起動 admin only（`create_new_instance`, `task_type`, `instance_name` 対応）
 - `POST /api/stop` - default インスタンス停止 admin only
 - `POST /api/instances/stop` - 指定 instance_id を停止 admin only
+- `POST /api/instances/{instance_id}/move` - 稼働中インスタンスを別 GPU へ移設 admin only
 - `POST /api/restart` - vLLM 再起動 admin only
 - `POST /api/instances/{instance_id}/smoke-test` - 最小リクエストで実際の応答を検証 admin only
 - `GET /api/log` - vLLM ログ admin only

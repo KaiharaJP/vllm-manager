@@ -93,18 +93,29 @@ def _lock_path_candidates(model_id: str) -> list[Path]:
     return [hf_home / ".locks" / model_dir, hf_home / "hub" / ".locks" / model_dir]
 
 
+def hf_download_dir() -> str:
+    """ダウンロード先。vLLM が読む標準位置 `<HF_HOME>/hub` に揃える。"""
+    return str(Path(os.environ.get("HF_HOME", "/app/hf-cache")) / "hub")
+
+
 def _cached_snapshot_path(model_id: str, revision: str | None = None) -> Path | None:
-    """Return snapshot path when the full model is locally cached."""
-    try:
-        snapshot_path = snapshot_download(
-            repo_id=model_id,
-            cache_dir=os.environ.get("HF_HOME", "/app/hf-cache"),
-            revision=revision,
-            local_files_only=True,
-        )
-        return Path(snapshot_path)
-    except Exception:
-        return None
+    """Return snapshot path when the full model is locally cached.
+
+    新レイアウト（<HF_HOME>/hub）を優先し、旧レイアウト（<HF_HOME>）も参照する。
+    """
+    hf_home = os.environ.get("HF_HOME", "/app/hf-cache")
+    for cache_dir in (hf_download_dir(), hf_home):
+        try:
+            snapshot_path = snapshot_download(
+                repo_id=model_id,
+                cache_dir=cache_dir,
+                revision=revision,
+                local_files_only=True,
+            )
+            return Path(snapshot_path)
+        except Exception:
+            continue
+    return None
 
 
 def _directory_size(path: Path) -> int:
@@ -779,7 +790,7 @@ async def _run_download_job(job: dict[str, Any], model: dict[str, Any]) -> None:
 
     await update(status="running", message="download started")
 
-    cache_dir = os.environ.get("HF_HOME", "/app/hf-cache")
+    cache_dir = hf_download_dir()
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_HUB_TOKEN")
     disable_xet = os.environ.get("HF_HUB_DISABLE_XET", "1") == "1"
     spec: dict[str, Any] = {

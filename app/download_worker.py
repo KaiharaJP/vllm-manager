@@ -15,7 +15,7 @@ def run_download_task(spec: dict[str, Any]) -> int:
     if spec.get("disable_xet"):
         os.environ["HF_HUB_DISABLE_XET"] = "1"
 
-    cache_dir = spec.get("cache_dir") or os.environ.get("HF_HOME", "/app/hf-cache")
+    cache_dir = spec.get("cache_dir") or os.path.join(os.environ.get("HF_HOME", "/app/hf-cache"), "hub")
     token = spec.get("token")
     repo_id = spec["repo_id"]
     revision = spec.get("revision")

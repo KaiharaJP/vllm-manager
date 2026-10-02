@@ -1328,10 +1328,10 @@ def start_server(
         result["steps"].append(f"モデルを確認中: {config['model_id']}")
         try:
             from huggingface_hub import snapshot_download
-            hf_home = os.environ.get("HF_HOME", "/app/hf-cache")
+            from app.model_manager import hf_download_dir
             snapshot_download(
                 repo_id=config["model_id"],
-                cache_dir=hf_home,
+                cache_dir=hf_download_dir(),
             )
             result["steps"].append(f"モデル準備完了: {config['model_id']}")
         except Exception as e:
